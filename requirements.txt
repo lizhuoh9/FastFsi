@@ -1,0 +1,8 @@
+# FastFsi: direct dependencies, pinned to the environment the export was tested in
+# (CPython 3.10.12, Linux x86_64; the GPU runs of the source tree used taichi 1.7.4 as well).
+numpy==2.1.2
+scipy==1.15.3
+taichi==1.7.4
+trimesh==4.11.5
+# tests only
+pytest==9.0.3

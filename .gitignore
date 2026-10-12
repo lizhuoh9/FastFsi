@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.venv/
+*.egg-info/
+# Taichi's offline-cache path of the CPU harness (tools/cpu_runtime.py; the cache itself is off)
+/tmp/
+# run outputs
+/runs/
