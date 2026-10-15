@@ -318,8 +318,8 @@ def main(argv=None):
     cv = ControlVolumeForce(fluid, j_range=j_range, k_range=k_range, origin_m=bounds_min, spacing_m=spacing,
                             grid_nodes=grid, span_m=float(cfg.span_m))
     y_tip0, z_tip0 = float(points[tip, 0]), float(points[tip, 1])
-    from fastfsi.io.restart import (CheckpointPlan, check_restart, checkpoint_bytes, code_manifest, device_identity,
-                                    grid_manifest, library_versions, restart_record, write_new_json)
+    from fastfsi.io.restart import (CheckpointPlan, checkpoint_bytes, code_manifest, device_identity, grid_manifest,
+                                    library_versions, restart_policy, restart_record, write_new_json)
     checkpointing = saved is not None or a.checkpoint_every_s > 0.0 or bool(a.checkpoint_at)
     components = manifest = resume = None
     if checkpointing:                              # what a checkpoint holds and what a restart must match
@@ -334,8 +334,11 @@ def main(argv=None):
                         libraries=library_versions(), device=device_identity(a.arch))
     if saved is not None:
         arrays, host, loop_state, saved_manifest, header = saved
-        code_diffs = check_restart(saved_manifest, manifest, diagnostic=a.diagnostic_restart,
-                                   output_name=a.output.name)
+        policy = restart_policy(saved_manifest, manifest, diagnostic=a.diagnostic_restart,
+                                output_name=a.output.name)
+        code_diffs = policy["overridable"]                  # the differences a diagnostic restart accepted
+        for line in policy["log"]:
+            print("TUREK_FAST restart policy: %s" % line, flush=True)
         # the inlet faces and the outlet-reachability marking depend only on the set-up and the time: rebuilt first,
         # then the checkpoint (with the solver's host counters) is loaded over them
         channel.write_channel_velocity_faces(fluid, cfg, float(loop_state["t"]))
@@ -344,7 +347,7 @@ def main(argv=None):
         load_components(components, arrays, host)
         resume = loop_state
         write_new_json(a.output / "restart.json", restart_record(a.restart_from, loop_state, saved_manifest, manifest,
-                                                                 header, code_diffs))
+                                                                 header, code_diffs, policy=policy))
         print("TUREK_FAST restart from %s at step %d t %.9g%s" % (a.restart_from, loop_state["step"], loop_state["t"],
                                                                   " (DIAGNOSTIC)" if code_diffs else ""), flush=True)
     vtk_writer, vtk_next = None, None

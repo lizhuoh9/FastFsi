@@ -262,8 +262,12 @@ def load_components(components, arrays, host):
             component.load_state_host(host[name])
 
 
+ABSENT = "<absent>"                    # compare_manifests' value for a key present on one side only
+
+
 def compare_manifests(saved, current, ignore=(), _path=""):
-    """Differences between two manifests (nested dicts / lists / scalars), skipping the key paths in `ignore`."""
+    """Differences between two manifests (nested dicts / lists / scalars), skipping the key paths in `ignore`; a key
+    present on one side only is reported with ABSENT on the other side."""
     diffs = []
     if _path in ignore:
         return diffs
@@ -273,7 +277,7 @@ def compare_manifests(saved, current, ignore=(), _path=""):
             if sub in ignore:
                 continue
             if key not in saved or key not in current:
-                diffs.append((sub, saved.get(key, "<absent>"), current.get(key, "<absent>")))
+                diffs.append((sub, saved.get(key, ABSENT), current.get(key, ABSENT)))
             else:
                 diffs.extend(compare_manifests(saved[key], current[key], ignore, sub))
     elif isinstance(saved, list) and isinstance(current, list) and len(saved) == len(current):
