@@ -1,8 +1,9 @@
-# FastFsi: direct dependencies, pinned to the environment the export was tested in
-# (CPython 3.10.12, Linux x86_64; the GPU runs of the source tree used taichi 1.7.4 as well).
+# fastfsi: direct dependencies, pinned to the environment the code was tested in (CPython 3.10.12, Linux x86_64;
+# GPU runs on NVIDIA GPUs of compute capability 7.5 and 8.6 through Taichi's CUDA backend).
 numpy==2.1.2
 scipy==1.15.3
 taichi==1.7.4
-trimesh==4.11.5
 # tests only
 pytest==9.0.3
+# Optional: hypre (https://github.com/hypre-space/hypre) built as a shared library (libHYPRE.so) for the PFMG pressure
+# solver; the default conjugate-gradient pressure solver does not need it.

@@ -1,0 +1,11 @@
+# Turek-Hron FSI2 with the benchmark's reference parameters only (Turek & Hron 2006).
+# Preset fsi2: U_mean 1.0 m/s (Re 100), rho_s 10000 kg/m^3 (density ratio 10), rho_f 1000 kg/m^3, E 1.4 MPa,
+# nu 0.4, mu_f 1 Pa s, 2 s cosine inlet ramp.  The excess mass (rho_s - rho_f) A0 rides on penalty-spring partner
+# points (the default --excess-mass-mode auto).  Periodic state: fit the oscillation of point A, drag and lift.
+# usage: python -B run_turek_hron_fsi.py @configs/fsi2.args --output DIR [--arch cuda]
+--preset fsi2
+--kappa-over-mu 4.666666666666667   # 2 (1 + nu) / (3 (1 - 2 nu)) for nu = 0.4
+--ib-kernel ib4                     # IB_4 regularized delta
+--grid 4,144,864                    # quasi-2-D: 4 span cells, h = 0.41 m / 144
+--end-time 10.0
+--row-interval 10

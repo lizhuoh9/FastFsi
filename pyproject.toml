@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "fastfsi"
+version = "0.1.0"
+description = "GPU fluid-structure interaction in Taichi: an incompressible MAC-grid fluid coupled to material-point solids by a diffuse immersed boundary"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = ["numpy>=2.1", "scipy>=1.15", "taichi==1.7.4"]
+
+[project.optional-dependencies]
+test = ["pytest>=8"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src", "tests", "examples/turek_hron_fsi"]
+markers = ["slow: runs the Turek-Hron example in separate processes (a few minutes on the CPU)"]

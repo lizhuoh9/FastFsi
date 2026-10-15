@@ -1,0 +1,9 @@
+"""Slot counts of the pressure-interface coupling storage."""
+
+
+PRESSURE_INTERFACE_COUPLING_SLOT_COUNT = 16
+
+
+PRESSURE_INTERFACE_COUPLING_EXTRA_SLOTS = (
+    PRESSURE_INTERFACE_COUPLING_SLOT_COUNT - 1
+)

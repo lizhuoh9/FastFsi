@@ -1,182 +1,152 @@
 # FastFsi
 
-Fast fluid-structure interaction (FSI) for soft bodies in water, on the GPU with [Taichi](https://github.com/taichi-dev/taichi).
+Fluid–structure interaction on the GPU with [Taichi](https://www.taichi-lang.org/): an incompressible fluid on a
+staggered (MAC) Cartesian grid is coupled to deformable solids, represented by material points, through a diffuse
+immersed boundary. This is research code: it is tested for consistency, not validated for engineering use.
 
-* **Coupling:** diffuse immersed boundary (IB, in the style of IB/IBFE). A single velocity field covers fluid and
-  solid. Forces are spread and velocities interpolated with the 4-point Peskin kernel (IB_4). On graded grids the
-  kernel works in index space and gets a first-moment (RKPM) correction.
-* **Solid:** material points (MPM-style) of a neo-Hookean body: modified invariants plus a volumetric penalty
-  kappa/2 (J - 1)^2. The solid has no momentum equation of its own. Its elastic stress is spread to the fluid as a
-  body force; the points move with the interpolated velocity, and F follows the interpolated velocity gradient.
-* **Fluid:** incompressible Navier-Stokes on a staggered (MAC), optionally graded Cartesian grid. A finite-volume
-  pressure projection is solved with CG preconditioned by geometric multigrid or, optionally, with hypre (PCG
-  preconditioned by PFMG).
-* **Extras for the squid soft robot:** an air chamber as a shifted-penalty pressure boundary, physical penalty
-  contact between the flaps and the rigid parts on a signed-distance field, and VTK output.
+## What is in the package
 
-> **Status: UNVALIDATED research prototype.** Results have not been validated against experiments or against a
-> sharp-interface reference. Every run writes this label into its outputs. Use the code to explore and prototype,
-> not to make engineering decisions.
-
-## Contents
-
-| path | what it is |
+| Package | Contents |
 |---|---|
-| `simulation_core/fast/` | the fast mode: `ib_mpm_fast3d.py` (3-D diffuse IB + material points), `ib_mpm_fast.py` (quasi-2-D variant, IB_4 kernel), `graded_kernel.py` (graded-grid kernel, face mask), `air_chamber_fast.py`, `rigid_contact.py`, `fluid_hooks.py`, `hypre_pressure.py` (optional hypre pressure solve), `vtk_export_fast.py` |
-| `simulation_core/fluids/` | the Cartesian fluid solver (`solver.py`), grid, spec, CUDA device controllers (`gpu_*.py`) |
-| `simulation_core/fluids/shared_definitions.py` | verbatim copies of the few definitions `fluids/*` takes from the sharp-interface coupling package of the original project (that package is not included) |
-| `simulation_core/diagnostics/`, `simulation_core/profiles/`, `simulation_core/k9_fast_hook.py` | Taichi runtime set-up, time-step helpers, the physics/execution profile the solver reads, a fast path for Taichi's `data_oriented` attribute hook |
-| `cases/turek_fast.py` (+ `turek_fast_case.py`, `turek_fast_kernels.py`) | Turek-Hron FSI1/FSI2/FSI3 benchmark driver (quasi-2-D; the geometry is generated) |
-| `cases/squid_fast.py` (+ `squid_fast_setup.py`, `cases/squid_setup/`) | squid soft-robot driver (you supply the geometry and its configuration) |
-| `tests/fast/` | CPU tests |
-| `tools/cpu_runtime.py` | CPU harness for the tests and for CPU runs of the drivers |
+| `fastfsi.fluid` | Incompressible Navier–Stokes on a graded Cartesian MAC grid: MUSCL-TVD momentum advection, viscous terms, projection with a multigrid-preconditioned conjugate-gradient pressure solve (optionally hypre PFMG), a pressure outlet with outlet-reachability marking, velocity Dirichlet faces and obstacle masks. On CUDA the solver's scalar convergence checks run on the device (`device_*` modules). |
+| `fastfsi.solid` | Material points with a neo-Hookean material in 3-D and in a plane (quasi-2-D), state guards (a non-finite state or J ≤ 0 stops the run), penalty contact against rigid level sets. |
+| `fastfsi.coupling` | The immersed-boundary coupling (IB_4 or IB_3 regularized delta), explicit Euler or the midpoint rule, clamps by direct forcing or penalty tethers, and the excess mass of solids denser than the fluid (penalty-spring partner points). |
+| `fastfsi.boundary` | Pressure chambers and per-cell pressure regions, gas regions and sealed gas pockets (isothermal gas law), the solid occupancy of grid cells, and a pneumatic chamber: a pressure inlet through a hole that a solid may cover. |
+| `fastfsi.geometry` | Signed distance and masks of closed triangulated solids. |
+| `fastfsi.grid` | Graded Cartesian grids and the fluid-domain specification. |
+| `fastfsi.io` | Create-only checkpoints (NPZ, a sha256 per array, type-exact host state, no pickle), restart checks, the joining of restarted segments, and VTK output for ParaView. |
+| `fastfsi.simulation` | Taichi runtime set-up and monitors (control-volume forces). |
 
-`cases/turek_fast_case.py`, `cases/turek_fast_kernels.py`, `cases/squid_setup/*.py` and
-`simulation_core/fluids/shared_definitions.py` hold verbatim copies of definitions from modules of the original
-project that are not included here. Every copied block names its source file, its line range and the source file's
-sha256.
+## Installation
 
-## Install
-
-Python 3.10, Linux x86_64. A CUDA-capable NVIDIA GPU is needed for real runs. The tests run on the CPU.
+Python 3.10 or newer. fastfsi runs on NVIDIA GPUs through Taichi's CUDA backend (it was run on GPUs of compute
+capability 7.5 and 8.6). The same code also runs on the CPU as an explicit opt-in (`--arch cpu` in the example,
+`TaichiRuntimeConfig(arch="cpu")` in code): slow, meant for testing and small cases. The tests run on the CPU with one
+thread (`tests/cpu_runtime.py`), so two runs give the same bits.
 
 ```bash
-python3.10 -m venv .venv
-. .venv/bin/activate
-pip install -r requirements.txt     # numpy, scipy, taichi 1.7.4, trimesh, pytest (pinned)
+python -m venv .venv && . .venv/bin/activate
+pip install -r requirements.txt
+pip install -e .
 ```
 
-### Optional: hypre for `--pressure-solver hypre_pfmg`
+### Optional: hypre PFMG
 
-`simulation_core/fast/hypre_pressure.py` loads `libHYPRE.so` through ctypes from the prefix given by
-`--hypre-prefix` or by the environment variable `HYPRE_PREFIX`. There is no default location. It needs a sequential
-build (MPI off), 32-bit `HYPRE_Int` and double precision, which is the default configuration. Build hypre v3.2.0
-from the official source (tag `v3.2.0` of https://github.com/hypre-space/hypre) with CMake.
+The default pressure solve, a multigrid-preconditioned conjugate gradient on the GPU, needs no external library. As an
+alternative, `fastfsi.fluid.pressure_hypre.install_hypre_pressure_solver(fluid, prefix=...)` replaces the linear solve
+of one fluid instance by hypre's Struct PCG with a PFMG (or SMG) preconditioner, through a thin ctypes layer (no
+compiled extension).
 
-GPU build. These are the flags we used on RTX 3080 / 3090 cards (compute capability 8.6); set
-`CMAKE_CUDA_ARCHITECTURES` to match your card:
+- Version: hypre 3.2.0 (https://github.com/hypre-space/hypre), Apache-2.0 or MIT.
+- Build: sequential and shared (MPI off, 32-bit `HYPRE_Int`, double precision); the layer refuses other builds. The CPU
+  build used here: `cmake -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=ON -DHYPRE_ENABLE_MPI=OFF
+  -DHYPRE_ENABLE_OPENMP=OFF -DHYPRE_ENABLE_CUDA=OFF`. The CUDA build (CUDA 12.8): `cmake -DCMAKE_BUILD_TYPE=Release
+  -DHYPRE_ENABLE_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=<sm> -DHYPRE_ENABLE_MPI=OFF -DBUILD_SHARED_LIBS=ON
+  -DHYPRE_ENABLE_SHARED=ON -DHYPRE_ENABLE_UMPIRE=OFF -DHYPRE_ENABLE_DEVICE_MALLOC_ASYNC=ON`, with `<sm>` the GPU's
+  compute capability (75 for Turing, e.g. a GTX 1660; 86 for an RTX 3080 / 3090).
+- Location: the `prefix` argument, else the environment variable `HYPRE_PREFIX`; the layer loads
+  `<prefix>/lib/libHYPRE.so` and reads `<prefix>/include/HYPRE_config.h` to tell a CUDA build from a CPU build. The CUDA
+  runtime is the copy libHYPRE itself loaded (or the library named by `HYPRE_CUDART`).
+- Data path: `data_path="host"` (default) stages the matrix and vectors through host memory; `data_path="pointer"`
+  hands hypre the Taichi arrays' device pointers (CUDA build with Taichi on CUDA) or host pointers (CPU build).
+- The Turek–Hron example uses the default conjugate-gradient solve.
+
+## Turek–Hron FSI benchmarks
+
+`examples/turek_hron_fsi` runs FSI1, FSI2 and FSI3 (Turek & Hron 2006) as a quasi-2-D channel: four cells along the
+span with fields uniform along it. The argument files in `configs/` select the benchmark presets, which hold the
+reference parameters of the benchmark table (densities, Young's modulus, Poisson ratio, viscosity, mean inflow, the 2 s
+inlet ramp), and set only the grid, the run length and the row cadence; nothing is tuned. The solid's volumetric
+modulus follows from the reference Poisson ratio: `--kappa-over-mu` defaults to 2(1 + ν) / (3(1 − 2ν)), 14/3 for the
+benchmark's ν = 0.4.
 
 ```bash
-cmake -S hypre/src -B hypre-build-cuda -DCMAKE_BUILD_TYPE=Release \
-  -DHYPRE_ENABLE_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=86 -DHYPRE_ENABLE_MPI=OFF \
-  -DBUILD_SHARED_LIBS=ON -DHYPRE_ENABLE_SHARED=ON -DHYPRE_ENABLE_UMPIRE=OFF \
-  -DHYPRE_ENABLE_DEVICE_MALLOC_ASYNC=ON -DCMAKE_INSTALL_PREFIX=$HOME/opt/hypre-3.2.0-cuda
-cmake --build hypre-build-cuda -j && cmake --install hypre-build-cuda
-export HYPRE_PREFIX=$HOME/opt/hypre-3.2.0-cuda
+cd examples/turek_hron_fsi
+python -B run_turek_hron_fsi.py @configs/fsi3.args --output runs/fsi3
 ```
 
-CPU build (for the hypre tests):
+A run writes `run_meta.json` (parameters, grid, layout), `history.csv` (time step and its limiter, the displacement of
+the material point nearest to point A (its index and reference position are in `run_meta.json`), drag and lift per unit
+span from a control-volume momentum balance, the range of J, the conjugate-gradient iterations, the volume drift of the
+beam, excess-mass slip), `final.json` (status), and optionally a VTK series (`--vtk-interval-s`).
+
+Long runs can be split by checkpoints and continued in a new output directory; the continuation reproduces the straight
+run bit for bit on the same device:
 
 ```bash
-cmake -S hypre/src -B hypre-build-cpu -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=ON \
-  -DHYPRE_ENABLE_MPI=OFF -DHYPRE_ENABLE_OPENMP=OFF -DHYPRE_ENABLE_CUDA=OFF \
-  -DHYPRE_ENABLE_HYPRE_BLAS=ON -DHYPRE_ENABLE_HYPRE_LAPACK=ON \
-  -DHYPRE_BUILD_EXAMPLES=OFF -DHYPRE_BUILD_TESTS=OFF -DCMAKE_INSTALL_PREFIX=$HOME/opt/hypre-3.2.0-cpu
-cmake --build hypre-build-cpu -j && cmake --install hypre-build-cpu
+python -B run_turek_hron_fsi.py @configs/fsi2.args --end-time 5 --checkpoint-every-s 1 --output runs/fsi2_a
+python -B run_turek_hron_fsi.py @configs/fsi2.args --end-time 10 --output runs/fsi2_b \
+    --restart-from runs/fsi2_a/checkpoints/checkpoint_s<step>.npz
+python -m fastfsi.io.run_segments runs/fsi2 runs/fsi2_a runs/fsi2_b --row-interval 10
 ```
 
-hypre replaces only the linear solve inside the fluid's pressure projection. Its result is accepted only when the
-solver's own residual check passes, so the CG remains the reference.
+A restart refuses a checkpoint whose set-up differs (any argument other than the output, the run length, the
+checkpoint and VTK cadences and the device; the grid; the beam set-up) or whose code or library versions differ;
+`--diagnostic-restart` accepts a code difference only into a directory whose name contains `DIAGNOSTIC`.
 
-## Running
+### Reference values
 
-All drivers write into a new output directory (it must not exist yet) and label every output UNVALIDATED.
+FeatFlow results on the finest level of the benchmark pages (point A displacement in m, drag and lift in N per unit
+depth; periodic cases as mean ± amplitude [frequency in Hz]); the FeatFlow reference time series of FSI2 and FSI3 use
+the same time steps. The original proposal (Turek & Hron 2006) lists slightly different values from coarser
+computations (second table).
 
-### Turek-Hron FSI3 (no input files)
+| FeatFlow, finest level | u_x(A) | u_y(A) | Drag | Lift |
+|---|---|---|---|---|
+| FSI1 (level 7+0, steady) | 2.2705e-5 | 8.2088e-4 | 14.294 | 0.7637 |
+| FSI2 (level 4+0, Δt = 0.0005) | −1.485e-2 ± 1.270e-2 [3.86] | 1.30e-3 ± 8.16e-2 [1.93] | 215.06 ± 77.65 [3.86] | 0.61 ± 237.8 [1.93] |
+| FSI3 (level 4+0, Δt = 0.00025) | −2.88e-3 ± 2.72e-3 [10.93] | 1.47e-3 ± 3.499e-2 [5.46] | 460.5 ± 27.74 [10.93] | 2.50 ± 153.91 [5.46] |
+
+| Turek & Hron 2006 | u_x(A) | u_y(A) | Drag | Lift |
+|---|---|---|---|---|
+| FSI1 | 2.27e-5 | 8.209e-4 | 14.295 | 0.7638 |
+| FSI2 | −1.458e-2 ± 1.244e-2 [3.8] | 1.23e-3 ± 8.06e-2 [2.0] | 208.83 ± 73.75 [3.8] | 0.88 ± 234.2 [2.0] |
+| FSI3 | −2.69e-3 ± 2.53e-3 [10.9] | 1.48e-3 ± 3.438e-2 [5.3] | 457.3 ± 22.66 [10.9] | 2.22 ± 149.78 [5.3] |
+
+## Known limitations
+
+- **Diffuse interface.** The IB_4 kernel spreads forces and interpolates velocities over about four cells: pressure
+  jumps across thin walls are smoothed and thin gaps leak unless they span several cells.
+- **Incompressible immersed solid.** The single-velocity coupling moves the solid with the divergence-free fluid
+  velocity, so J stays close to 1 and the volumetric modulus mainly limits drift. The Turek–Hron beam (Saint
+  Venant–Kirchhoff, ν = 0.4) is compressible; the immersed beam bends stiffer (higher frequency, smaller amplitude).
+- **Excess mass by penalty springs.** A solid denser than the fluid carries its excess mass on partner points tied to
+  the material points by stiff springs; the finite stiffness allows a small slip (reported in the history), and the
+  spring bound can limit the time step.
+- **Gravity on the excess mass is not modelled.**
+- **Inlet resistance is not modelled.** The pneumatic chamber imposes the inlet pressure at the hole; there is no
+  orifice pressure loss.
+- **Membrane volume error.** Thin membranes of material points gain or lose enclosed volume over a run; drivers should
+  monitor the reported volume error and stop at a threshold.
+- **Explicit elasticity.** The time step is limited by the elastic shear-wave CFL condition (and by the excess-mass
+  spring bound), so stiff solids need many small steps.
+- **Quasi-2-D benchmarks.** The Turek–Hron cases are 2-D problems run on the 3-D solver with four span cells.
+- **Reproducibility.** GPU runs are not bit-reproducible from run to run (floating-point atomics); CPU runs with one
+  thread are.
+- One GPU per run; no distributed memory and no adaptive mesh refinement.
+
+## Tests
 
 ```bash
-# GPU
-python -B -m cases.turek_fast --preset fsi3 --grid 4,96,576 --end-time 4.0 --output runs/fsi3 --arch cuda
-# CPU (slow; for checks): a few steps through the CPU harness
-python -B -m tools.cpu_runtime --module cases.turek_fast --preset fsi3 --grid 4,96,576 --end-time 1.0 \
-    --max-steps 5 --output runs/fsi3_cpu --arch cpu
+pytest                 # everything; the checkpoint split test runs the example in separate processes (minutes)
+pytest -m "not slow"   # without it
 ```
 
-Outputs: `history.csv` (time, time step and its limiter, tip displacement of point A, drag and lift per unit span
-from a control-volume momentum balance, J range, volume error, CG iterations, wall time per step), `run_meta.json`
-and `final.json`. Options: `--preset fsi1|fsi2|fsi3`, `--grid nx,ny,nz` (nx = 4 cells across the span, quasi-2-D),
-`--ramp-time`, `--cfl-elastic`, `--cfl-advective`, `--kappa-over-mu`, `--spacing-over-h`, `--max-steps`,
-`--row-interval` (see `python -m cases.turek_fast --help`).
+## References
 
-### Squid soft robot (bring your own geometry)
+- S. Turek, J. Hron, Proposal for numerical benchmarking of fluid-structure interaction between an elastic object and
+  laminar incompressible flow, in: Fluid-Structure Interaction, Lecture Notes in Computational Science and Engineering
+  53, Springer (2006) 371–385.
+- FeatFlow FSI benchmark results:
+  https://wwwold.mathematik.tu-dortmund.de/~featflow/en/benchmarks/cfdbenchmarking/fsi_benchmark/fsi_tests/fsi_fsi_tests.html
+- C. S. Peskin, The immersed boundary method, Acta Numerica 11 (2002) 479–517.
+- A. M. Roma, C. S. Peskin, M. J. Berger, An adaptive version of the immersed boundary method, Journal of
+  Computational Physics 153 (1999) 509–534.
+- Y. Kim, C. S. Peskin, Penalty immersed boundary method for an elastic boundary with mass, Physics of Fluids 19
+  (2007) 053103.
+- Y. Hu, Y. Fang, Z. Ge, Z. Qu, Y. Zhu, A. Pradhana, C. Jiang, A moving least squares material point method with
+  displacement discontinuity and two-way rigid body coupling, ACM Transactions on Graphics 37(4) (2018) 150.
+- Methods of [IBAMR](https://github.com/IBAMR/IBAMR) and [taichi_mpm](https://github.com/yuanming-hu/taichi_mpm) are
+  referenced in the code; see [NOTICE](NOTICE).
 
-The squid geometry and its configuration are **not** distributed. `--source-config` (or the environment variable
-`SQUID_SOURCE_CONFIG`) points to the `simulation_config.json` exported by the original project's pre-processor. It
-holds the surface mesh (STL, or STEP with its surface-mesh cache), the named regions, the materials and the
-chamber-pressure load. `cases/squid_fast_setup.py` fixes the roles of the regions and some geometry constants for
-the authors' robot: region 1 is the valve flap, region 2 the main membrane, regions 3 and 4 are rigid, region 5 is
-the fixed rim. It also fixes the membrane band heights and the valve-rim radius. Adapt these for another geometry.
-
-```bash
-python -B -m cases.squid_fast --source-config path/to/simulation_config.json --output runs/squid \
-    --end-time 0.05 --arch cuda [--pressure-solver hypre_pfmg --hypre-prefix $HYPRE_PREFIX] \
-    [--vtk-points-interval-s 0.005 --vtk-3d-interval-s 0.05] [--snapshot-interval-s 0.01] [--sdf-cache-dir DIR]
-python -B -m cases.squid_fast --source-config path/to/simulation_config.json --output runs/squid_setup \
-    --arch cuda --setup-only          # build and check the grid, obstacle and material points only
-```
-
-Outputs: `setup_report.json`, `history.csv`, `valve_log.jsonl`, `run_meta.json`, `final.json`, and on request
-`snapshots/` (npz) and `vtk/` (ParaView `.pvd` collections). Hard stops (non-finite state, velocity or pressure
-bound, volume error, empty one-sided kernel support) write `hard_stop.json`.
-
-## Tests (CPU)
-
-```bash
-python -B -m tools.cpu_runtime tests/fast -q
-```
-
-The production runtime is GPU-only, so the tests go through the CPU harness `tools/cpu_runtime.py`. It sets up
-Taichi on one CPU thread and changes only the backend selection. Some tests need inputs that are not part of this
-repository and are skipped without them:
-
-* `SQUID_SOURCE_CONFIG=path/to/simulation_config.json` enables the four squid driver tests and one cross-check of
-  the air-chamber test;
-* `HYPRE_PREFIX=path/to/hypre-cpu-prefix` enables the hypre tests.
-
-## Dormant code paths and unsupported options
-
-* **The fluid solver is shared.** `simulation_core/fluids/solver.py` is the fluid solver of the original project,
-  shared with its sharp-interface (HIBM) FSI mode. It still contains that mode's code paths: sharp-interface pressure
-  rows, marker constraints, component ledgers and the related reports. The fast mode never activates them, and the
-  sharp-interface modules that drive them are not included.
-* **Execution switches stay off.** Leave every switch of `UNIFIED_PHYSICS.execution` in
-  `simulation_core/profiles/soft_body.py` (`native_dispatch` and the `device_*` switches) at its default `False`.
-  `simulation_core/native_dispatch/` is not included, so turning `native_dispatch` on fails with an `ImportError`.
-* **Lazy imports with no target.** These imports sit inside functions that the fast mode does not call, and their
-  targets are not part of this repository:
-  * `simulation_core/fluids/solver.py`, `CartesianFluidSolver._solve_pressure_poisson_fv_cg`:
-    `simulation_core.native_dispatch.wave1` (only with `native_dispatch` on)
-  * `simulation_core/fluids/gpu_fluid_host.py`, `solve_with_native_regions`: `simulation_core.native_dispatch.regions`
-    (only with `native_dispatch` on)
-  * `simulation_core/profiles/soft_body.py`: `runtime_identity` (`hibm_native_reference`), `identity`,
-    `advance`, `boundary_policy`, `configure_coupling`, `build_boundary`, `marker_projector`
-    (`simulation_core.coupling.hibm_mpm.*`), `coupling_config` (`simulation_core.drivers.generic_fsi_solver`),
-    `prepare_execution` (`simulation_core.native_dispatch.wave2`, only with `native_dispatch` on). These are the
-    sharp-interface profile methods.
-* **CUDA path checked statically only.** The CPU tests do not exercise the CUDA-only code: the device controllers
-  `simulation_core/fluids/gpu_*.py`, `scalar_maximum` in `shared_definitions.py` (its class `TailKernels` is reduced
-  to the one kernel it uses), and the CUDA data path of `hypre_pressure.py`. This code passes the static checks
-  (undefined names, imports). The corresponding code of the source tree ran on GPUs, but this export has not yet run
-  on a GPU.
-
-## Credits
-
-* IBAMR v0.19.0 (BSD-3-Clause, copyright the IBAMR developers): conventions of the side-centred IB_4 interpolation
-  and spreading, the F update (MIDPOINT_RULE), and the target-point / penalty-tether form that the contact penalty is
-  based on. These are reused as algorithms; no source is copied.
-* taichi_mpm (MIT, copyright Yuanming Hu and the Taichi MPM authors): the MLS-MPM stress term and the
-  deformation-gradient update, and the normal-only penetration penalty against level sets. These are reused as
-  algorithms.
-* A. Pinelli, I. Z. Naqavi, U. Piomelli, J. Favier, "Immersed-boundary methods for general finite-difference and
-  finite-volume Navier-Stokes solvers", J. Comput. Phys. 229 (2010) 9073-9091: the reproducing-kernel (moment)
-  correction of the delta weights on non-uniform grids used in `graded_kernel.py`.
-* hypre (Apache-2.0 or MIT, copyright Lawrence Livermore National Security, LLC and the HYPRE developers): the
-  optional Struct PCG + PFMG/SMG pressure solve. It is used as an external library, built separately, and no hypre
-  source is included.
-* PETSc v3.26.0 (BSD-2-Clause): looked at for the treatment of Dirichlet rows (`MatZeroRowsColumns`); no source copied.
-* Taichi (Apache-2.0).
-
-The docstrings' "reuse check" notes refer to `reference_libs/`: read-only local copies of the upstream sources
-listed above (IBAMR v0.19.0, PETSc v3.26.0, hypre v3.2.0, taichi_mpm). They are not part of this repository.
-
-No licence has been chosen for this repository yet.
+See [CHANGELOG.md](CHANGELOG.md) for the changes and [ROADMAP.md](ROADMAP.md) for planned work.

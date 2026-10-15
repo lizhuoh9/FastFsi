@@ -1,0 +1,10 @@
+# Turek-Hron FSI3 with the benchmark's reference parameters only (Turek & Hron 2006).
+# Preset fsi3: U_mean 2.0 m/s (Re 200), rho_s = rho_f = 1000 kg/m^3, E 5.6 MPa, nu 0.4, mu_f 1 Pa s,
+# 2 s cosine inlet ramp.  Periodic state: fit the oscillation of point A, drag and lift.
+# usage: python -B run_turek_hron_fsi.py @configs/fsi3.args --output DIR [--arch cuda]
+--preset fsi3
+--kappa-over-mu 4.666666666666667   # 2 (1 + nu) / (3 (1 - 2 nu)) for nu = 0.4
+--ib-kernel ib4                     # IB_4 regularized delta
+--grid 4,96,576                     # quasi-2-D: 4 span cells, h = 0.41 m / 96
+--end-time 10.0
+--row-interval 10
