@@ -44,6 +44,7 @@ from fastfsi.boundary.gas_regions_device import DeviceGasRegions
 from fastfsi.boundary.solid_occupancy import (DEFAULT_BOX_SAMPLES, DEFAULT_HYSTERESIS_STEPS, DEFAULT_STRETCH_FACTOR,
                                         DEFAULT_SUB, SolidOccupancy)
 from fastfsi.boundary.pressure_regions import DEFAULT_PENALTY_FACTOR, PressureRegions
+from fastfsi.boundary.pressure_regions import PROJECT_REQUIREMENTS  # noqa: F401 (the contract here too)
 from fastfsi.errors import SimulationHardStop
 from fastfsi.point_tags import TAG_CHAMBER_SURFACE
 
@@ -78,6 +79,8 @@ def _no_run_transfers():
 @ti.data_oriented
 class PneumaticChamber:
     """See the module docstring."""
+
+    PROJECT_REQUIREMENTS = PROJECT_REQUIREMENTS   # its PressureRegions' contract
 
     def __init__(self, fluid, axes, points, *, body_indices, reference_positions_m, spacing_m, point_mass_kg,
                  axis_xy_m, radius_m, lid_z_m, box_z_lo_m, inlet_centre_xy_m, inlet_diameter_m,
@@ -276,7 +279,8 @@ class PneumaticChamber:
         last = self.last or {}
         return dict(rep, air_volume_m3=last.get("air_volume_m3"), air_cells=last.get("air_cells"),
                     divergence_residual_water_max_1ps=rep["water_divergence_max_1ps"] if divergence else None,
-                    divergence_residual_outlet_max_1ps=None, pockets=last.get("pockets"),
+                    divergence_residual_outlet_max_1ps=rep["outlet_divergence_max_1ps"] if divergence else None,
+                    pockets=last.get("pockets"),
                     inlet_covered=self.covered, traction_steps=self.traction_steps,
                     pocket_volume_m3=last.get("pocket_volume_m3"), pocket_p_min_abs_pa=last.get("pocket_p_min_abs_pa"),
                     pocket_p_max_abs_pa=last.get("pocket_p_max_abs_pa"), omega_max_rad_s=last.get("omega_max_rad_s"),

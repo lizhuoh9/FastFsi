@@ -12,6 +12,13 @@ First version of the package layout `src/fastfsi` (replaces the earlier flat lay
 - Excess mass for solids denser than the fluid (`fastfsi.coupling.excess_mass`, penalty-spring partner points).
 - Boundary models: pressure chambers and pressure regions, gas regions and sealed gas pockets (isothermal gas law),
   solid occupancy, and a pneumatic chamber (a pressure inlet through a hole that a solid may cover).
+- Shifted-pressure chambers carry their projection contract (`PROJECT_REQUIREMENTS`: z-min outlet, outlet backflow
+  allowed, no pressure accumulation) as a class attribute; `fastfsi.boundary.outlet_guard.merge_project_requirements`
+  merges it into the caller's `project()` arguments and raises when a chamber declares none or a caller value
+  conflicts.  `OutletShiftGuard` checks that the solver's and the chamber's halves of the shifted outlet correction meet
+  (one `after_project()` per `update()`; `FASTFSI_STRICT_INVARIANTS=1` turns a violation into a hard stop).
+  `PneumaticChamber` exports the contract and reports the outlet-layer divergence; `PressureRegions` reports the
+  outlet-layer and interior divergence separately.
 - Checkpoint / restart: `fastfsi.io.checkpoint` (create-only NPZ checkpoints), `fastfsi.io.restart` (checkpoint
   schedule, manifest checks), `fastfsi.io.run_segments` (joins restarted segments).
 - Turek–Hron example: `--checkpoint-every-s`, `--checkpoint-at`, `--restart-from`, `--diagnostic-restart`; argument

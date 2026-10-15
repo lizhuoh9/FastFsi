@@ -79,6 +79,8 @@ import math
 import numpy as np
 import taichi as ti
 
+from fastfsi.boundary.outlet_guard import PROJECT_REQUIREMENTS as SHIFTED_OUTLET_REQUIREMENTS
+from fastfsi.boundary.outlet_guard import OutletShiftGuard, merge_project_requirements  # noqa: F401 (re-export)
 from fastfsi.errors import SimulationHardStop
 from fastfsi.io.checkpoint import Checkpointable
 from fastfsi.point_tags import TAG_CHAMBER_SURFACE
@@ -89,8 +91,7 @@ DEFAULT_CANDIDATE_MARGIN_M = 2.0e-3      # candidate-table margin (m): affects t
 CIRCUMRADIUS_OVER_COLUMN_DIAGONAL = 0.5  # keep triangles with circumradius <= 0.5 x their column's diagonal
                                          # (sub-lattice triangles: 0.25; hull slivers / long hull triangles: much more)
 BARYCENTRIC_TOLERANCE = 1.0e-9           # relative: a centre on a shared edge belongs to both triangles
-PROJECT_REQUIREMENTS = dict(pressure_outlet_zmin=True, pressure_solver="fv_cg", cg_preconditioner="fv_multigrid",
-                            pressure_outlet_backflow_policy="allow", accumulate_pressure_into_previous=False)
+PROJECT_REQUIREMENTS = SHIFTED_OUTLET_REQUIREMENTS   # the shifted outlet's projection contract (outlet_guard.py)
 HOLE_REASONS = {1: "no_surface_point_and_outside_the_current_surface", 2: "no_surface_point_and_inverted_covering_triangle"}
 # stats slots (one f64 field, read once by report())
 S_HOLE_EVENTS, S_HOLE_T, S_HOLE_I, S_HOLE_J, S_NO_AIR_EVENTS, S_NO_AIR_T = 0, 1, 2, 3, 4, 5
@@ -275,6 +276,7 @@ class ColumnPressureChamber(Checkpointable):
     # column flags and the host counters; every other field is setup or rewritten by _update_kernel before use
     CHECKPOINT_FIELDS = ("stats", "fallback_seen")
     CHECKPOINT_HOST = ("steps", "_fb_columns_seen", "_fb_lines", "last_p_air_pa", "last_t_s")
+    PROJECT_REQUIREMENTS = PROJECT_REQUIREMENTS   # the contract travels with the class (merged strictly)
 
     def __init__(self, fluid, axes, footprint, lid_z_m, points, *, penalty_factor=DEFAULT_PENALTY_FACTOR,
                  tag_bit=TAG_CHAMBER_SURFACE, fallback_events_path=None, candidate_margin_m=DEFAULT_CANDIDATE_MARGIN_M,
@@ -311,6 +313,7 @@ class ColumnPressureChamber(Checkpointable):
         self.footprint_columns = int(footprint.sum())
         self.air_cell = ti.field(ti.i32, shape=shape)
         self.outlet_rhs = ti.field(ti.f64, shape=shape[:2])      # this module's copy of R at k = 0
+        self.outlet_guard = OutletShiftGuard(fluid)               # exactly once + the outlet invariant
         self.stats = ti.field(ti.f64, shape=STATS_SLOTS)
         self.stats.fill(0.0)
         self._physical_pressure = None
@@ -697,6 +700,7 @@ class ColumnPressureChamber(Checkpointable):
         self.last_p_air_pa = p_air
         self.last_t_s = float(t_s)
         self.steps += 1
+        self.outlet_guard.arm()
 
     def after_project(self, dt_s, p_air_pa):
         """Outlet-face correction for the nonzero ghost value p~_out = -p_air (one kernel; no host reads)."""
@@ -706,7 +710,9 @@ class ColumnPressureChamber(Checkpointable):
         dt_over_rho = float(dt_s) / self.rho
         if not (math.isfinite(dt_over_rho) and dt_over_rho > 0.0):
             raise ValueError("dt_s must be finite and positive")
+        self.outlet_guard.before(self.outlet_rhs, dt_over_rho)   # consumes update()'s arming
         self._after_project_kernel(dt_over_rho, dt_over_rho)
+        self.outlet_guard.after(self.outlet_rhs, dt_over_rho)
 
     def physical_pressure_into(self, out_field):
         """out = p~ + p_air (physical pressure, Pa) in fluid cells, 0 in obstacle cells (device only)."""
@@ -799,6 +805,7 @@ class ColumnPressureChamber(Checkpointable):
                 first_t_s=float(s[S_F1_FIRST_T]) if s[S_F1_TOTAL] > 0 else None,
                 max_raise_m=float(s[S_F1_MAX_RAISE]))
             self._reset_f1_interval_kernel()
+        out.update(self.outlet_guard.report())                    # guard maxima since the last report
         return out
 
     def close(self):

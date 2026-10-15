@@ -31,13 +31,15 @@ import math
 import numpy as np
 import taichi as ti
 
+from fastfsi.boundary.outlet_guard import OutletShiftGuard
 from fastfsi.boundary.pressure_chamber import DEFAULT_PENALTY_FACTOR, PROJECT_REQUIREMENTS  # noqa: F401 (re-export)
 from fastfsi.io.checkpoint import Checkpointable
 
 DEFAULT_MAX_POCKETS = 4096
 # statistics slots (read by report() only)
 S_INLET_CELLS, S_POCKET_CELLS, S_DIRICHLET_PMAX, S_WATER_DIV, S_JUMP_ROWS, S_OUTLET_FLUX = 0, 1, 2, 3, 4, 5
-STATS_SLOTS = 6
+S_OUTLET_DIV, S_INTERIOR_DIV = 6, 7     # the water residual split into the outlet layer and the rest
+STATS_SLOTS = 8
 
 
 @ti.data_oriented
@@ -46,6 +48,7 @@ class PressureRegions(Checkpointable):
 
     CHECKPOINT_FIELDS = ("box_code", "pocket_gauge")
     CHECKPOINT_HOST = ("pocket_count", "last_p_in_pa", "last_t_s", "steps")
+    PROJECT_REQUIREMENTS = PROJECT_REQUIREMENTS   # the contract travels with the class (merged strictly)
 
     def __init__(self, fluid, box_cells, *, penalty_factor=DEFAULT_PENALTY_FACTOR, max_pockets=DEFAULT_MAX_POCKETS):
         shape = tuple(int(v) for v in fluid.grid.grid_nodes)
@@ -70,6 +73,7 @@ class PressureRegions(Checkpointable):
         self.r_jump = ti.field(ti.f64, shape=shape)
         self.outlet_rhs = ti.field(ti.f64, shape=shape[:2])
         self.stats = ti.field(ti.f64, shape=STATS_SLOTS)
+        self.outlet_guard = OutletShiftGuard(fluid)               # exactly once + the outlet invariant
         self.pocket_count = 0
         self.last_p_in_pa = None
         self.last_t_s = None
@@ -220,6 +224,8 @@ class PressureRegions(Checkpointable):
         self.stats[S_DIRICHLET_PMAX] = 0.0
         self.stats[S_WATER_DIV] = 0.0
         self.stats[S_OUTLET_FLUX] = 0.0
+        self.stats[S_OUTLET_DIV] = 0.0
+        self.stats[S_INTERIOR_DIV] = 0.0
         for i, j, k in self.p_ref:
             if self.fluid.obstacle[i, j, k] == 0:
                 p_tilde = ti.cast(self.fluid.pressure[i, j, k], ti.f64)
@@ -230,6 +236,10 @@ class PressureRegions(Checkpointable):
                                       + self.fluid.pressure_interface_projection_divergence_s[i, j, k]
                                       - ti.cast(self.fluid.volume_source_s[i, j, k], ti.f64))
                     ti.atomic_max(self.stats[S_WATER_DIV], residual)
+                    if k == 0:
+                        ti.atomic_max(self.stats[S_OUTLET_DIV], residual)
+                    else:
+                        ti.atomic_max(self.stats[S_INTERIOR_DIV], residual)
                 if k == 0 and self._code(i, j, k) == 0:
                     area = ti.cast(self.fluid.cell_width_x_m[i], ti.f64) * ti.cast(self.fluid.cell_width_y_m[j], ti.f64)
                     ti.atomic_add(self.stats[S_OUTLET_FLUX], ti.cast(self.fluid.velocity[i, j, 0].z, ti.f64) * area)
@@ -270,6 +280,7 @@ class PressureRegions(Checkpointable):
         self.last_p_in_pa = p_in
         self.last_t_s = float(t_s)
         self.steps += 1
+        self.outlet_guard.arm()
 
     def after_project(self, dt_s, p_in_pa):
         """The face terms of the reference jumps and the outlet ghost (one kernel, no host reads)."""
@@ -279,7 +290,9 @@ class PressureRegions(Checkpointable):
         dt_over_rho = float(dt_s) / self.rho
         if not (math.isfinite(dt_over_rho) and dt_over_rho > 0.0):
             raise ValueError("dt_s must be finite and positive")
+        self.outlet_guard.before(self.outlet_rhs, dt_over_rho)   # consumes update()'s arming
         self._after_project_kernel(dt_over_rho, dt_over_rho)
+        self.outlet_guard.after(self.outlet_rhs, dt_over_rho)
 
     def physical_pressure_into(self, out_field):
         """out = p~ + p_ref (physical gauge pressure, Pa) in fluid cells, 0 in obstacle cells (device only)."""
@@ -301,4 +314,6 @@ class PressureRegions(Checkpointable):
         return dict(inlet_cells=int(s[S_INLET_CELLS]), pocket_cells=int(s[S_POCKET_CELLS]),
                     pockets=self.pocket_count, dirichlet_p_tilde_max_pa=float(s[S_DIRICHLET_PMAX]),
                     water_divergence_max_1ps=float(s[S_WATER_DIV]), jump_rows=int(s[S_JUMP_ROWS]),
-                    outlet_flux_m3s=float(s[S_OUTLET_FLUX]), p_in_pa=self.last_p_in_pa, t_s=self.last_t_s)
+                    outlet_flux_m3s=float(s[S_OUTLET_FLUX]), p_in_pa=self.last_p_in_pa, t_s=self.last_t_s,
+                    outlet_divergence_max_1ps=float(s[S_OUTLET_DIV]),
+                    interior_divergence_max_1ps=float(s[S_INTERIOR_DIV]), **self.outlet_guard.report())
