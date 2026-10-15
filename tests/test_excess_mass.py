@@ -23,27 +23,31 @@ def cpu():
 
 
 def make_body(dim=3, rho_s=10., rho_f=1., *, tether=(0,), clamp="penalty", omega=20.,
-              positions=None, volumes=None, initial_v=(.2, -.1, .05), origin=None, grid=None):
+              positions=None, volumes=None, initial_v=(.2, -.1, .05), origin=None, grid=None, mode="auto",
+              velocity_field=None):
     grid = grid or ((1, 8, 8) if dim == 2 else (8, 8, 8))
     origin = origin or (0., 0., 0.)
     positions = np.asarray(positions if positions is not None else [[3.5] * dim], dtype=np.float32)
     volumes = np.asarray(volumes if volumes is not None else np.ones(len(positions)), dtype=np.float32)
     fluid = SimpleNamespace(rho=rho_f, velocity=ti.Vector.field(3, ti.f32, shape=grid),
                             force=ti.Vector.field(3, ti.f32, shape=grid))
-    fluid.velocity.from_numpy(np.broadcast_to(np.array(initial_v, np.float32), grid + (3,)).copy())
+    if velocity_field is None:
+        fluid.velocity.from_numpy(np.broadcast_to(np.array(initial_v, np.float32), grid + (3,)).copy())
+    else:
+        fluid.velocity.from_numpy(np.asarray(velocity_field, dtype=np.float32))
     mat = NeoHookeanMaterial(rho_s, 1., 10.)
     if dim == 2:
         points = PlanarMaterialPoints(positions_yz_m=positions, areas_m2=volumes, material=mat,
                                       tether_mask=np.asarray(tether, np.int32))
         body = PlanarImmersedBoundaryCoupler(fluid=fluid, points=points, tether_stiffness_pa_per_m=0.,
             grid_origin_m=origin, grid_spacing_m=(1., 1., 1.), grid_nodes=grid, span_m=1., clamp=clamp,
-            excess_mass_omega_rad_s=omega)
+            excess_mass_mode=mode, excess_mass_omega_rad_s=omega)
     else:
         points = MaterialPoints(positions_m=positions, volumes_m3=volumes, material=mat,
                                 tether_mask=np.asarray(tether, np.int32))
         body = ImmersedBoundaryCoupler(fluid=fluid, points=points, tether_stiffness_pa_per_m=0.,
             weights=KernelWeights(UniformAxes(origin, (1., 1., 1.), grid)), mask=AllValidFaceMask(),
-            interior_shortcut=False, clamp=clamp, excess_mass_omega_rad_s=omega)
+            interior_shortcut=False, clamp=clamp, excess_mass_mode=mode, excess_mass_omega_rad_s=omega)
     return body, fluid, points
 
 
@@ -196,33 +200,51 @@ def test_planar_spring_uses_relative_f64_displacement_at_large_absolute_offset()
     np.testing.assert_array_equal(ex.spring_force.to_numpy(), np.array([[.0036, -.0072]], dtype=np.float32).astype(np.float64))
 
 
-def test_equal_density_has_no_new_fields_and_matches_original_neutral_kernels(tmp_path):
-    # Save the production methods before replacing them with original source at the same runtime state.
-    import importlib.util
-    from pathlib import Path
-    original = Path(__file__).resolve().parents[1] / "dev/density_ratio_20261014_01/implementation/original/fastfsi_dev/src/fastfsi/coupling/immersed_boundary.py.original"
-    spec = importlib.util.spec_from_file_location("neutral_ib_before_density", original.with_suffix(".py"))
-    # SourceFileLoader supports the preserved .original extension without copying or changing the source.
-    from importlib.machinery import SourceFileLoader
-    spec = importlib.util.spec_from_loader("neutral_ib_before_density", SourceFileLoader("neutral_ib_before_density", str(original)))
-    old = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(old)
-    body, fluid, points = make_body(2, rho_s=1.)
-    assert body.excess_mass is None
-    before_names = {name for name, value in vars(body).items() if hasattr(value, "to_numpy")}
-    oldbody = old.PlanarImmersedBoundaryCoupler(fluid=fluid, points=points, tether_stiffness_pa_per_m=0.,
-        grid_origin_m=(0., 0., 0.), grid_spacing_m=(1., 1., 1.), grid_nodes=(1, 8, 8), span_m=1.)
-    assert before_names == {name for name, value in vars(oldbody).items() if hasattr(value, "to_numpy")}
-    originals = {name: getattr(points, name).to_numpy().copy() for name in ("x", "v", "F")}
-    body.spread_elastic_force(dt_s=.001)
-    force = fluid.force.to_numpy().tobytes()
-    body.move_with_fluid(.001)
-    new = {name: getattr(points, name).to_numpy().tobytes() for name in originals}
-    for name, value in originals.items(): getattr(points, name).from_numpy(value)
-    oldbody.spread_elastic_force(dt_s=.001)
-    assert force == fluid.force.to_numpy().tobytes()
-    oldbody.move_with_fluid(.001)
-    assert new == {name: getattr(points, name).to_numpy().tobytes() for name in originals}
+@pytest.mark.parametrize("dim", (2, 3))
+def test_equal_density_builds_no_partner_and_auto_steps_bitwise_as_off(dim):
+    """At rho_s = rho_f the excess-mass partner is not built: "auto" holds exactly the fields of the diagnostic "off"
+    mode, and three explicit steps (spread + move) with real dynamics are bitwise equal.  Three points at distinct,
+    non-symmetric positions, the same non-uniform fluid velocity (a linear shear plus a fixed-seed random part) and the
+    same pre-strained F in both bodies, so the spread force, the motion and the change of F are all non-zero (asserted);
+    a denser body does build the partner."""
+    grid = (1, 8, 8) if dim == 2 else (8, 8, 8)
+    positions = np.array([[3.3, 2.7, 4.1], [4.6, 3.9, 2.8], [2.4, 4.7, 3.6]], dtype=np.float32)[:, :dim]
+    nodes = np.indices(grid).transpose(1, 2, 3, 0).astype(np.float64)          # unit spacing, origin 0
+    shear = np.stack([.2 + .05 * nodes[..., 2], -.1 + .03 * nodes[..., 0] + .04 * nodes[..., 2],
+                      .05 + .02 * nodes[..., 1]], axis=-1)
+    velocity = (shear + .01 * np.random.default_rng(20261015).standard_normal(grid + (3,))).astype(np.float32)
+    off_diagonal = np.array([[0., 1., .3], [-.4, 0., .5], [.2, .7, 0.]])[:dim, :dim]     # not symmetric
+    strain = np.stack([np.eye(dim) + .02 * (1. + .1 * p) * off_diagonal for p in range(len(positions))]).astype(np.float32)
+    bodies = []
+    for mode in ("auto", "off"):
+        body, fluid, points = make_body(dim, rho_s=1., mode=mode, tether=(0, 0, 0), positions=positions,
+                                        velocity_field=velocity)
+        points.F.from_numpy(strain)
+        points.F_n.from_numpy(strain)
+        bodies.append((body, fluid, points))
+    (auto, fluid_auto, points_auto), (off, fluid_off, points_off) = bodies
+    heavy, _, _ = make_body(dim, rho_s=10.)
+    assert auto.excess_mass is None and off.excess_mass is None and heavy.excess_mass is not None
+    fields = lambda body: {name for name, value in vars(body).items() if hasattr(value, "to_numpy")}
+    assert fields(auto) == fields(off)
+    F_after = []
+    for step in range(3):
+        for body in (auto, off):
+            body.spread_elastic_force(dt_s=.001)
+        force = fluid_auto.force.to_numpy()
+        if step == 0:
+            assert np.abs(force).max() > 0.                                     # a real elastic force is spread
+        assert force.tobytes() == fluid_off.force.to_numpy().tobytes()
+        for body in (auto, off):
+            body.move_with_fluid(.001)
+        for name in ("x", "v", "F"):
+            assert getattr(points_auto, name).to_numpy().tobytes() == getattr(points_off, name).to_numpy().tobytes()
+        if step == 0:
+            assert len({row.tobytes() for row in points_auto.v.to_numpy()}) == len(positions)   # points move differently
+        F_after.append(points_auto.F.to_numpy().copy())
+    assert not np.array_equal(F_after[0], F_after[2])                           # F evolves between steps 1 and 3
+
+
 class PeriodicMacOracle:
     """Actual FV periodic projection oracle around production IB, not CartesianFluidSolver acceptance.
 
