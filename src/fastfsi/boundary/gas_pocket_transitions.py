@@ -9,13 +9,19 @@ CODES (also the device classification of boundary/gas_regions_device.py):
     3 water pocket, 4 + k air pocket k.
 
 COMPONENTS.  The candidate cells (free cells reached by neither flood) form 6-connected components.  Each component's
-PARENTS are the previous codes of its cells.  A component with an air parent (INLET_GAS or an air pocket) and a water parent
-(LIQUID or a water pocket) is the hard stop gas_pocket_origin_ambiguous; one without air parents is a water pocket
-(code 3; freed material counts as no parent, unless the device's type memory reports the class of the cell's last
-free code -- INLET_GAS, LIQUID or a water pocket -- as its previous code).  A component with an old air pocket among
-its parents continues that
-pocket lineage: it is an air pocket (new number, in the order of the components' smallest cell index, so the numbering
-is deterministic).
+PARENTS are the previous codes of its cells that were free before this update (freed material counts as no parent).  A
+component with an air parent (INLET_GAS or an air pocket) and a water parent (LIQUID or a water pocket) is the hard stop
+gas_pocket_origin_ambiguous; one without air parents is a water pocket (code 3).  A component with an old air pocket
+among its parents continues that pocket lineage: it is an air pocket (new number, in the order of the components'
+smallest cell index, so the numbering is deterministic).
+HISTORY (the device's type memory; a TIE-BREAKER only): a freed cell's previous code may be the negated class of its
+last free code (HISTORY_GAS -1, HISTORY_LIQUID -2, HISTORY_LIQUID_POCKET -3; 0 = no history).  Real parents decide
+whenever a component has one, its freed cells' histories ignored.  Only a component made of freed cells alone is typed
+by the histories of its cells (cells without a history do not vote): gas histories only -> a candidate region of the
+inlet gas (its gas-history cells count as INLET_GAS: the sealing rule and the seal-time gas); liquid histories only ->
+a water pocket; gas and liquid histories ("mixed") or none ("none") -> the old rule, a water pocket.  plan.history
+lists every freed-only component with its class (gas / liquid / mixed / none), so the caller counts how often each
+happens.
 
 SEALING RULE.  A component whose air parents are inlet air only (no old pocket) is a CANDIDATE REGION cut off from
 the inlet.  It becomes a sealed air pocket only when it has persisted `seal_steps` consecutive occupancy updates (the
@@ -49,6 +55,8 @@ from scipy.sparse.csgraph import connected_components
 from fastfsi.errors import SimulationHardStop
 
 MATERIAL, INLET_GAS, LIQUID, LIQUID_POCKET, FIRST_POCKET = 0, 1, 2, 3, 4
+HISTORY_GAS, HISTORY_LIQUID, HISTORY_LIQUID_POCKET = -INLET_GAS, -LIQUID, -LIQUID_POCKET   # freed: last free class
+HISTORY_CLASSES = ("gas", "liquid", "mixed", "none")
 FATE_MATERIAL, FATE_AIR, FATE_WATER, FATE_CANDIDATE = 0, 1, 2, 3
 HARD_STOP_CODES = {"gas_pocket_origin_ambiguous", "gas_pocket_zero_volume", "gas_pocket_ambiguous_topology",
                    "gas_region_gas_to_liquid"}
@@ -100,9 +108,12 @@ class PocketTransitionPlan:
     air_cells_of_new: np.ndarray       # per new pocket: its cells that were INLET_GAS
     cells_of_new: np.ndarray           # per new pocket: its cell count
     candidate_regions: np.ndarray = None   # per candidate cell: its new pending-region number (1-based), 0 = none
-    regions: tuple = ()                # per new pending region (number = position + 1): dict(age, cells, parents)
-    sealed: tuple = ()                 # candidate regions sealed now: dict(pocket, age, cells, parents)
+    regions: tuple = ()                # per new pending region (number = position + 1): dict(age, cells, parents,
+                                       # history: True when typed by its cells' gas history)
+    sealed: tuple = ()                 # candidate regions sealed now: dict(pocket, age, cells, parents, history)
     ended: tuple = ()                  # old pending regions ended unsealed: dict(region, how, fate)
+    history: tuple = ()                # per freed-only component: dict(how (HISTORY_CLASSES), cells, region (its
+                                       # pending number, 0 none), pocket (its new pocket number, -1 none), first_index)
 
 
 def continuing_pockets(plan):
@@ -139,11 +150,11 @@ def _parents_by_component(component, region, count):
 def plan_pocket_transitions(indices, previous_codes, fate, old_pockets, shape, *, t_s, previous_regions=None,
                             region_ages=(), region_fate=None, seal_steps=1, min_cells=1):
     """Components, codes, the gas plan and the candidate regions of one topology change (see the module docstring).
-    indices / previous_codes: the candidate cells (any order); fate: (old_pockets, 4) cell counts per old pocket
-    (material, INLET_GAS, LIQUID, candidate); previous_regions: per candidate cell, its old pending-region number
-    (0 = none); region_ages: per old pending region r (r = 1 .. R), its age INCLUDING this update; region_fate:
-    (R, 4) cell counts per old region; seal_steps / min_cells: the sealing rule (1 / 1 = every candidate seals at
-    once)."""
+    indices / previous_codes: the candidate cells (any order; a previous code below 0 is a freed cell's history,
+    HISTORY_*); fate: (old_pockets, 4) cell counts per old pocket (material, INLET_GAS, LIQUID, candidate);
+    previous_regions: per candidate cell, its old pending-region number (0 = none); region_ages: per old pending region
+    r (r = 1 .. R), its age INCLUDING this update; region_fate: (R, 4) cell counts per old region; seal_steps /
+    min_cells: the sealing rule (1 / 1 = every candidate seals at once)."""
     seal_steps, min_cells = int(seal_steps), int(min_cells)
     if seal_steps < 1 or min_cells < 1:
         raise ValueError("seal_steps and min_cells must be >= 1")
@@ -151,6 +162,8 @@ def plan_pocket_transitions(indices, previous_codes, fate, old_pockets, shape, *
     prev = np.asarray(previous_codes, dtype=np.int64)
     if prev.shape != idx.shape:
         raise ValueError("one previous code per candidate cell")
+    if prev.size and prev.min() < HISTORY_LIQUID_POCKET:
+        raise ValueError("previous codes must be >= %d (below 0: a freed cell's history)" % HISTORY_LIQUID_POCKET)
     order = np.argsort(idx, kind="stable")
     idx, prev = idx[order], prev[order]
     ages = np.asarray(region_ages, dtype=np.int64).reshape(-1)
@@ -173,12 +186,25 @@ def plan_pocket_transitions(indices, previous_codes, fate, old_pockets, shape, *
                                                                 cells=fate[water_hit, FATE_WATER].tolist()))
     component = sealed_components(idx, shape)
     count = int(component.max()) + 1 if len(component) else 0
+    # the history as a tie-breaker: real parents (cells free before this update) decide whenever a component has one;
+    # a component of freed cells alone is typed by its cells' histories (cells without a history do not vote)
+    real, gas_history, liquid_history = (np.zeros(count, dtype=bool) for _ in range(3))
+    np.logical_or.at(real, component, prev > MATERIAL)
+    np.logical_or.at(gas_history, component, prev == HISTORY_GAS)
+    np.logical_or.at(liquid_history, component, (prev == HISTORY_LIQUID) | (prev == HISTORY_LIQUID_POCKET))
+    freed_only = ~real
+    by_gas_history = freed_only & gas_history & ~liquid_history
+    parent = np.where(prev > MATERIAL, prev, MATERIAL)
+    parent = np.where(by_gas_history[component] & (prev == HISTORY_GAS), INLET_GAS, parent)
+    history_class = np.select([by_gas_history, freed_only & liquid_history & ~gas_history,
+                               freed_only & gas_history & liquid_history, freed_only],
+                              list(HISTORY_CLASSES), default="")
     air_parent = np.zeros(count, dtype=bool)
     water_parent = np.zeros(count, dtype=bool)
     pocket_parent = np.zeros(count, dtype=bool)
-    np.logical_or.at(air_parent, component, (prev == INLET_GAS) | (prev >= FIRST_POCKET))
-    np.logical_or.at(water_parent, component, (prev == LIQUID) | (prev == LIQUID_POCKET))
-    np.logical_or.at(pocket_parent, component, prev >= FIRST_POCKET)
+    np.logical_or.at(air_parent, component, (parent == INLET_GAS) | (parent >= FIRST_POCKET))
+    np.logical_or.at(water_parent, component, (parent == LIQUID) | (parent == LIQUID_POCKET))
+    np.logical_or.at(pocket_parent, component, parent >= FIRST_POCKET)
     ambiguous = np.flatnonzero(air_parent & water_parent)
     if ambiguous.size:
         cells = idx[component == ambiguous[0]]
@@ -206,11 +232,11 @@ def plan_pocket_transitions(indices, previous_codes, fate, old_pockets, shape, *
     in_pocket = pocket[component]
     pocket_of = new_number[component]
     cells_of_new = np.bincount(pocket_of[in_pocket], minlength=pockets)
-    air_cells_of_new = np.bincount(pocket_of[in_pocket & (prev == INLET_GAS)], minlength=pockets)
+    air_cells_of_new = np.bincount(pocket_of[in_pocket & (parent == INLET_GAS)], minlength=pockets)
     old_to_new = {}
-    from_old = in_pocket & (prev >= FIRST_POCKET)
+    from_old = in_pocket & (parent >= FIRST_POCKET)
     if from_old.any():
-        pairs, counts = np.unique(np.stack((prev[from_old] - FIRST_POCKET, pocket_of[from_old])), axis=1,
+        pairs, counts = np.unique(np.stack((parent[from_old] - FIRST_POCKET, pocket_of[from_old])), axis=1,
                                   return_counts=True)
         for (old, new), n in zip(pairs.T, counts):
             old_to_new.setdefault(int(old), {})[int(new)] = int(n)
@@ -232,9 +258,16 @@ def plan_pocket_transitions(indices, previous_codes, fate, old_pockets, shape, *
                     new_with_several_parents=shared))
     # the candidate regions: new pending ones, sealed ones, and the old ones that ended unsealed
     parents = _parents_by_component(component, preg, count)
-    regions = tuple(dict(age=int(age[c]), cells=int(size[c]), parents=parents[c]) for c in np.flatnonzero(pending))
-    sealed = tuple(dict(pocket=int(new_number[c]), age=int(age[c]), cells=int(size[c]), parents=parents[c])
-                   for c in np.flatnonzero(seal))
+    regions = tuple(dict(age=int(age[c]), cells=int(size[c]), parents=parents[c], history=bool(by_gas_history[c]))
+                    for c in np.flatnonzero(pending))
+    sealed = tuple(dict(pocket=int(new_number[c]), age=int(age[c]), cells=int(size[c]), parents=parents[c],
+                        history=bool(by_gas_history[c])) for c in np.flatnonzero(seal))
+    first_cell = np.full(count, len(idx), dtype=np.int64)
+    np.minimum.at(first_cell, component, np.arange(len(idx)))
+    history = tuple(dict(how=str(history_class[c]), cells=int(size[c]), region=int(region_number[c]),
+                         pocket=int(new_number[c]),
+                         first_index=[int(v) for v in np.unravel_index(int(idx[first_cell[c]]), shape)])
+                    for c in np.flatnonzero(freed_only))
     kept, merged = set(), set()
     for c in range(count):
         for r in parents[c]:
@@ -254,7 +287,7 @@ def plan_pocket_transitions(indices, previous_codes, fate, old_pockets, shape, *
     return PocketTransitionPlan(candidate_codes=codes[back], pockets=pockets, old_to_new=old_to_new,
                       old_to_air_cells=fate[:, FATE_AIR].copy(), air_cells_of_new=air_cells_of_new,
                       cells_of_new=cells_of_new, candidate_regions=cand_region[back], regions=regions,
-                      sealed=sealed, ended=tuple(ended))
+                      sealed=sealed, ended=tuple(ended), history=history)
 
 
 def allocate_pocket_gas(plan, old_gas_pa_m3, new_volumes_m3, *, inlet_absolute_pa, air_volume_m3, air_cells):

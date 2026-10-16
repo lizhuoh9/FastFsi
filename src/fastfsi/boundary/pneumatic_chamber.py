@@ -259,12 +259,12 @@ class PneumaticChamber:
                     noise_event_pockets=self.noise_event_pockets, noise_events=[dict(e) for e in self.noise_events],
                     seal_steps=regions.seal_steps, min_cells=regions.min_cells,
                     raster_interval=regions.raster_interval, raster_skips=regions.raster_skips,
-                    candidate_counters=dict(regions.candidate_counters),
+                    type_memory=regions.type_memory, candidate_counters=dict(regions.candidate_counters),
                     candidate_events=[dict(e) for e in regions.candidate_events],
                     candidates_pending_at_end=len(regions.pending_regions))
 
     def drain_candidate_events(self):
-        """The candidate-region events since the last drain (created / sealed / ended), then cleared."""
+        """The candidate-region events since the last drain (created / history / sealed / ended), then cleared."""
         out, self.candidate_events_pending = self.candidate_events_pending, []
         return out
 

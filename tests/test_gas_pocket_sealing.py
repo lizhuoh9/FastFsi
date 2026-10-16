@@ -282,10 +282,19 @@ def test_a_gas_side_void_freed_while_enclosed_rejoins_the_gas():
     out2 = r.step(m2, 0.2, p_in(2))
     assert r.device.codes()[W] == 1 and r.device.cand_id.to_numpy()[W] > 0       # a pending region of the inlet gas
     assert out2["pockets"] == 0 and out2["candidates_pending"] == 1
+    assert out2["candidate_counters"]["history_gas"] == 1
     out3 = r.step(m3, 0.3, p_in(3))                                  # N's release joins W to the gas: no stop
     assert r.device.codes()[W] == 1 and out3["pockets"] == 0 and out3["candidates_pending"] == 0
     c = out3["candidate_counters"]
     assert (c["created"], c["sealed"], c["reconnected"]) == (1, 0, 1)
+    assert (c["history_gas"], c["history_liquid"], c["history_mixed"], c["history_none"]) == (1, 0, 0, 0)
+    created, = [e for e in r.events if e["kind"] == "created"]
+    history, = [e for e in r.events if e["kind"] == "history"]
+    ended, = [e for e in r.events if e["kind"] == "ended"]
+    assert created["typed_by_history"] and ended["typed_by_history"] and ended["how"] == "reconnected"
+    assert (history["how"], history["typed_as"], history["cells"], history["census_id"]) == (
+        "gas", "inlet gas", 1, created["census_id"])
+    assert history["first_box_index"] == list(W)
 
 
 def test_the_gas_side_void_stops_the_run_without_type_memory():
@@ -293,8 +302,9 @@ def test_the_gas_side_void_stops_the_run_without_type_memory():
     m0, m1, m2, m3 = gas_side_void(r)
     r.step(m0, 0.0, p_in(0))
     r.step(m1, 0.1, p_in(1))
-    r.step(m2, 0.2, p_in(2))
+    out2 = r.step(m2, 0.2, p_in(2))
     assert r.device.codes()[W] == 3                                  # the old rule: freed material is a water pocket
+    assert out2["candidate_counters"]["history_none"] == 1           # no history without the memory
     with pytest.raises(SimulationHardStop) as stop:
         r.step(m3, 0.3, p_in(3))
     assert stop.value.code == "gas_region_liquid_to_gas"
@@ -322,34 +332,92 @@ def test_a_freed_void_with_a_liquid_history_is_a_water_pocket_and_a_true_flip_st
     r.step(m0, 0.0, p_in(0))
     assert r.device.last_free.to_numpy()[L] == 2
     r.step(m1, 0.1, p_in(1))
-    r.step(m2, 0.2, p_in(2))
+    out2 = r.step(m2, 0.2, p_in(2))
     assert r.device.codes()[L] == 3                                  # liquid history: a water pocket, as before
+    assert out2["candidate_counters"]["history_liquid"] == 1
+    history, = [e for e in r.events if e["kind"] == "history"]
+    assert (history["how"], history["typed_as"], history["cells"]) == ("liquid", "water pocket", 1)
     with pytest.raises(SimulationHardStop) as stop:                  # gas reaches the water: still the hard stop
         r.step(m3, 0.3, p_in(3))
     assert stop.value.code == "gas_region_liquid_to_gas"
 
 
-def test_mixed_histories_are_ambiguous():
+A = (3, 3, 4)                        # the gas cell above the slab cell S
+COLUMN = [A, S, L]
+
+
+def test_freed_only_mixed_histories_fall_back_to_a_water_pocket_and_are_counted():
     """A gas-history cell above the slab, the slab cell (never free) and a liquid-history cell below, freed together and
-    enclosed: one region with a gas and a liquid parent is gas_pocket_origin_ambiguous (the old rule: a water pocket)."""
-    column = [(3, 3, 4), S, L]
+    enclosed: a region of freed cells alone with mixed histories keeps the old rule (a water pocket, no stop), counted
+    as history_mixed with a "history" event; without the memory it is a region without history (history_none)."""
     for memory in (True, False):
         r = rig(type_memory=memory)
         r.step(r.slab, 0.0, p_in(0))
-        closed = enclose(r.slab, column)
-        for cell in column:
+        closed = enclose(r.slab, COLUMN)
+        for cell in COLUMN:
             closed[cell] = True
         r.step(closed, 0.1, p_in(1))
         opened = closed.copy()
-        for cell in column:
+        for cell in COLUMN:
             opened[cell] = False
-        if memory:
-            with pytest.raises(SimulationHardStop) as stop:
-                r.step(opened, 0.2, p_in(2))
-            assert stop.value.code == "gas_pocket_origin_ambiguous"
-        else:
-            r.step(opened, 0.2, p_in(2))
-            assert all(r.device.codes()[cell] == 3 for cell in column)
+        out = r.step(opened, 0.2, p_in(2))
+        assert all(r.device.codes()[cell] == 3 for cell in COLUMN), memory
+        c = out["candidate_counters"]
+        assert (c["history_mixed"], c["history_none"]) == ((1, 0) if memory else (0, 1)), memory
+        assert [e["how"] for e in r.events if e["kind"] == "history"] == (["mixed"] if memory else []), memory
+
+
+def test_a_real_air_parent_decides_over_a_freed_liquid_history():
+    """A gas cell enclosed alone (a pending region of the inlet gas), then the slab cell below it and a liquid-history
+    cell below that freed into the same region: its real parent (the inlet gas) decides, the freed cells' histories
+    are ignored -- the region stays a pending inlet-gas region (the same census id), not gas_pocket_origin_ambiguous,
+    and no freed-only region is counted."""
+    r = rig()
+    r.step(r.slab, 0.0, p_in(0))
+    m1 = enclose(r.slab, COLUMN)
+    m1[L] = True                                                     # L covered: its liquid history in last_free
+    out1 = r.step(m1, 0.1, p_in(1))
+    assert r.device.codes()[A] == 1 and out1["candidates_pending"] == 1
+    m2 = m1.copy()
+    m2[S] = m2[L] = False
+    out2 = r.step(m2, 0.2, p_in(2))
+    assert all(r.device.codes()[cell] == 1 for cell in COLUMN)
+    assert out2["candidates_pending"] == 1 and out2["candidate_cells_pending"] == 3 and out2["pockets"] == 0
+    c = out2["candidate_counters"]
+    assert c["created"] == 1 and sum(c["history_" + k] for k in ("gas", "liquid", "mixed", "none")) == 0
+    assert r.device.pending_regions[0]["age"] == 2 and not r.device.pending_regions[0]["typed_by_history"]
+
+
+def test_the_plan_types_only_freed_only_components_by_history():
+    """plan_pocket_transitions on a row of cells (shape 1 x 1 x 20; components are runs of indices): real parents
+    decide, history types freed-only components only, cells without a history do not vote; with the earlier rule a
+    gas-history cell seals at the inlet pressure (counted as inlet gas)."""
+    from fastfsi.boundary.gas_pocket_transitions import plan_pocket_transitions
+    shape = (1, 1, 20)
+    runs = [([0, 1], [1, -2]),        # a real air parent and a liquid history: a pending region (not ambiguous)
+            ([3], [-1]),              # gas history: a pending region
+            ([5], [-2]),              # liquid history: a water pocket
+            ([7, 8], [-1, -3]),       # mixed: a water pocket
+            ([10], [0]),              # no history: a water pocket
+            ([12, 13], [-1, 0]),      # gas history and a cell without one: a pending region
+            ([15, 16], [2, -1])]      # a real liquid parent and a gas history: a water pocket (not ambiguous)
+    idx = [i for cells, _ in runs for i in cells]
+    prev = [p for _, codes in runs for p in codes]
+    none = np.zeros((0, 4), dtype=np.int64)
+    plan = plan_pocket_transitions(idx, prev, none, 0, shape, t_s=0.0, seal_steps=N_SEAL, min_cells=M_MIN)
+    assert plan.candidate_codes.tolist() == [1, 1, 1, 3, 3, 3, 3, 1, 1, 3, 3]
+    assert [(h["how"], h["cells"]) for h in plan.history] == [("gas", 1), ("liquid", 1), ("mixed", 2), ("none", 1),
+                                                              ("gas", 2)]
+    assert [(h["region"], h["pocket"]) for h in plan.history] == [(2, -1), (0, -1), (0, -1), (0, -1), (3, -1)]
+    assert [r["history"] for r in plan.regions] == [False, True, True] and plan.pockets == 0
+    at_once = plan_pocket_transitions([3], [-1], none, 0, shape, t_s=0.0)          # the earlier rule (1, 1)
+    assert (at_once.pockets, at_once.candidate_codes.tolist(), at_once.air_cells_of_new.tolist()) == (1, [4], [1])
+    assert at_once.sealed[0]["history"] and at_once.history[0]["pocket"] == 0
+    with pytest.raises(SimulationHardStop) as stop:                                 # real parents: unchanged
+        plan_pocket_transitions([0, 1], [1, 2], none, 0, shape, t_s=0.0)
+    assert stop.value.code == "gas_pocket_origin_ambiguous"
+    with pytest.raises(ValueError):
+        plan_pocket_transitions([0], [-4], none, 0, shape, t_s=0.0)
 
 
 def test_type_memory_survives_a_checkpoint_round_trip():
@@ -370,4 +438,17 @@ def test_type_memory_survives_a_checkpoint_round_trip():
         assert np.array_equal(r.device.codes(), other.device.codes()), n
         assert np.array_equal(r.device.last_free.to_numpy(), other.device.last_free.to_numpy()), n
         assert a["candidate_counters"] == b["candidate_counters"], n
-    assert b["candidate_counters"]["reconnected"] == 1
+    assert b["candidate_counters"]["reconnected"] == 1 and b["candidate_counters"]["history_gas"] == 1
+
+
+def test_a_state_saved_without_history_counters_loads_them_at_zero():
+    r = rig()
+    r.step(r.slab, 0.0, p_in(0))
+    arrays = {name: r.device.state_array(name) for name in r.device.state_array_names()}
+    host = copy.deepcopy(r.device.state_host())
+    for key in ("history_gas", "history_liquid", "history_mixed", "history_none"):
+        del host["candidate_counters"][key]                          # a state of the code before the counters
+    other = rig()
+    other.device.load_state_arrays(arrays)
+    other.device.load_state_host(host)
+    assert other.device.candidate_counters == r.device.candidate_counters

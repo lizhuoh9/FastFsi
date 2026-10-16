@@ -46,13 +46,15 @@ earlier rule (every candidate sealed at once).
 TYPE MEMORY (type_memory, default on): every commit records, per box cell, the class of its last free code (field
 last_free: INLET_GAS, LIQUID or a water pocket; 0 when the cell was never free since the start, or last belonged to a
 sealed air pocket, whose number does not survive a renumbering).  A candidate cell that was material before the
-classification reports that class as its previous code, so gas_pocket_transitions types a sealed region of freed cells
-by its cells' history: a void freed on the gas side is a candidate region of the inlet gas (the sealing rule; joining
-the inlet gas again ends it as "reconnected"), a void with a liquid history is a water pocket, mixed histories are
-the hard stop gas_pocket_origin_ambiguous; cells with no history keep the old rule (a water pocket).  Without it, a
-one-cell void that a flickering rasterised surface enclosed for one update on the gas side became a water pocket and
-the next update's gas contact stopped the run (gas_region_liquid_to_gas) although gas and liquid never met.  last_free
-is checkpointed.
+classification reports that class NEGATED as its previous code (gas_pocket_transitions.HISTORY_*), so the history is
+only a tie-breaker: real parents decide whenever a component has one; a sealed region of freed cells alone is typed by
+its cells' histories -- gas only: a candidate region of the inlet gas (the sealing rule; joining the inlet gas again
+ends it as "reconnected"); liquid only: a water pocket; mixed or none: the old rule, a water pocket.  Every freed-only
+region is counted by its class (candidate counters history_gas / history_liquid / history_mixed / history_none;
+"history" events for the first three); a pending region typed by its gas history carries typed_by_history into its
+records and its sealed / ended events.  Without the memory, a one-cell void that a flickering rasterised surface
+enclosed for one update on the gas side became a water pocket and the next update's gas contact stopped the run
+(gas_region_liquid_to_gas) although gas and liquid never met.  last_free is checkpointed.
 RASTER INTERVAL (raster_interval N >= 1, default 1): with N > 1 only every Nth refresh re-rasterises the body
 (SolidOccupancy.update); the others reuse the last occupancy (no flips, no topology stage, no ageing) while volumes,
 pressures and the step check run at every refresh.  A restart keeps the cadence: the refresh count is carried, and
@@ -122,6 +124,9 @@ STATS_SLOTS = S_WORST_CHECKED + 1
 NOISE_EVENT_VOLUME_M3 = 5.0e-9           # 5 mm^3
 NOISE_EVENT_DP_PA = 1.0e3                # 1 kPa
 CANDIDATE_EVENT_LOG_MAX = 200            # the first candidate-region events kept in full (counters complete)
+CANDIDATE_COUNTERS = dict(created=0, sealed=0, covered=0, reconnected=0, merged=0, cells_max=0, age_max=0,
+                          ended_volume_m3=0.0, ended_fraction_max=0.0, census_next=0, history_gas=0, history_liquid=0,
+                          history_mixed=0, history_none=0)
 STAGE_ROWS = 3                           # staging rows: linear index, code, pending-region number
 
 
@@ -205,7 +210,7 @@ class DeviceGasRegions(Checkpointable):
         self.new_code = ti.field(ti.i32, shape=shape)
         self.reach = ti.field(ti.i32, shape=shape)
         self.cand = ti.field(ti.i32, shape=cells)
-        self.cand_prev = ti.field(ti.i32, shape=cells)
+        self.cand_prev = ti.field(ti.i32, shape=cells)            # previous codes (< 0: a freed cell's history)
         self.cand_preg = ti.field(ti.i32, shape=cells)            # the candidates' old region numbers
         self.cand_id = ti.field(ti.i32, shape=shape)              # pending-region number per cell (0 none)
         self.new_cand = ti.field(ti.i32, shape=shape)
@@ -242,8 +247,7 @@ class DeviceGasRegions(Checkpointable):
         self.seal_events = 0
         self.pocket_set_unchanged = 0
         self.pending_regions = []        # one dict per pending region (number = position + 1)
-        self.candidate_counters = dict(created=0, sealed=0, covered=0, reconnected=0, merged=0, cells_max=0,
-                                       age_max=0, ended_volume_m3=0.0, ended_fraction_max=0.0, census_next=0)
+        self.candidate_counters = dict(CANDIDATE_COUNTERS)
         self.candidate_events = []       # the first CANDIDATE_EVENT_LOG_MAX events
         self.candidate_events_new = []   # the events of the last refresh (for the caller; not carried)
         self.raster_skips = 0
@@ -337,8 +341,8 @@ class DeviceGasRegions(Checkpointable):
                     slot = ti.atomic_add(self.ctr[C_CANDIDATES], 1)
                     self.cand[slot] = linear
                     parent = old
-                    if memory != 0 and old == 0:          # type memory: a freed cell reports its last free class
-                        parent = self.last_free[i, j, k]
+                    if memory != 0 and old == 0:          # type memory: a freed cell reports its last free class,
+                        parent = -self.last_free[i, j, k]     # negated (a history, never a real parent)
                     self.cand_prev[slot] = parent
                     self.cand_preg[slot] = old_region
                     if old < 3:
@@ -768,11 +772,17 @@ class DeviceGasRegions(Checkpointable):
         by cell overlap from the oldest parent region), the regions sealed now and the old regions that ended unsealed
         (counters and events; an ended region's free volume is its last refresh's, its fraction of the inlet air that
         refresh's inlet-air volume, its age the updates it persisted as a candidate; a sealed region's age includes the
-        sealing update)."""
+        sealing update).  The freed-only regions are counted by their history class (history_*; a "history" event for
+        gas / liquid / mixed), and a region typed by its gas history is flagged typed_by_history in its records and in
+        its sealed / ended events."""
         old, counters, events = self.pending_regions, self.candidate_counters, []
         volumes = self._read(self.rV)[:len(plan.regions)] if plan.regions else np.zeros(0)
+        def typed_parent(parents):            # a region typed by its gas history keeps the flag through its lineage
+            return any(old[r - 1].get("typed_by_history", False) for r in parents)
+
         new = []
         for region, volume in zip(plan.regions, volumes):
+            typed = bool(region.get("history")) or typed_parent(region["parents"])
             if region["parents"]:
                 first = min((old[r - 1] for r in region["parents"]), key=lambda o: (o["born_t_s"], o["census_id"]))
                 census_id, born = first["census_id"], first["born_t_s"]
@@ -781,18 +791,32 @@ class DeviceGasRegions(Checkpointable):
                 counters["census_next"] += 1
                 counters["created"] += 1
                 events.append(dict(kind="created", census_id=census_id, t_s=float(t_s), cells=region["cells"],
-                                   free_volume_m3=float(volume), inlet_gauge_pa=float(inlet_gauge_pa)))
+                                   free_volume_m3=float(volume), inlet_gauge_pa=float(inlet_gauge_pa),
+                                   typed_by_history=typed))
             new.append(dict(census_id=census_id, born_t_s=born, age=region["age"], cells=region["cells"],
-                            free_volume_m3=float(volume)))
+                            free_volume_m3=float(volume), typed_by_history=typed))
             counters["cells_max"] = max(counters["cells_max"], region["cells"])
             counters["age_max"] = max(counters["age_max"], region["age"])
+        for h in plan.history:
+            counters["history_" + h["how"]] += 1
+            if h["how"] == "none":
+                continue
+            typed_as = "inlet gas" if h["how"] == "gas" else "water pocket"
+            event = dict(kind="history", how=h["how"], t_s=float(t_s), cells=h["cells"],
+                         first_box_index=h["first_index"], typed_as=typed_as)
+            if h["region"] > 0:
+                event["census_id"] = new[h["region"] - 1]["census_id"]
+            if h["pocket"] >= 0:
+                event["pocket"] = h["pocket"]
+            events.append(event)
         for s in plan.sealed:
             counters["sealed"] += 1
             counters["cells_max"] = max(counters["cells_max"], s["cells"])
             counters["age_max"] = max(counters["age_max"], s["age"])
             events.append(dict(kind="sealed", census_ids=[old[r - 1]["census_id"] for r in s["parents"]],
                                t_s=float(t_s), age=s["age"], cells=s["cells"], pocket=s["pocket"],
-                               volume_m3=float(pocket_volumes[s["pocket"]]), inlet_gauge_pa=float(inlet_gauge_pa)))
+                               volume_m3=float(pocket_volumes[s["pocket"]]), inlet_gauge_pa=float(inlet_gauge_pa),
+                               typed_by_history=bool(s.get("history")) or typed_parent(s["parents"])))
         air = self.last_air_volume_m3
         for e in plan.ended:
             o = old[e["region"] - 1]
@@ -804,7 +828,8 @@ class DeviceGasRegions(Checkpointable):
                 counters["ended_fraction_max"] = max(counters["ended_fraction_max"], fraction)
             events.append(dict(kind="ended", how=e["how"], census_id=o["census_id"], t_s=float(t_s),
                                born_t_s=o["born_t_s"], age=o["age"] - 1, cells=o["cells"], free_volume_m3=volume,
-                               fraction_of_inlet_air=fraction, fate=e["fate"]))
+                               fraction_of_inlet_air=fraction, fate=e["fate"],
+                               typed_by_history=bool(o.get("typed_by_history", False))))
         self.pending_regions = new
         self.candidate_events_new.extend(events)
         room = CANDIDATE_EVENT_LOG_MAX - len(self.candidate_events)
@@ -923,8 +948,10 @@ class DeviceGasRegions(Checkpointable):
     def load_state_host(self, values):
         """Checkpointable.load_state_host, then the region bounds (the arrays are loaded first): the pending regions fit
         the region tables and every cell's pending-region number names one of them; otherwise the fate and volume
-        kernels would index out of bounds.  Raises ValueError."""
+        kernels would index out of bounds.  Raises ValueError.  A state saved before the history counters existed loads
+        with those counters at 0 (they count from the restart on)."""
         super().load_state_host(values)
+        self.candidate_counters = dict(CANDIDATE_COUNTERS, **self.candidate_counters)
         regions = len(self.pending_regions)
         if regions > self.max_pockets:
             raise ValueError("%d pending regions in the loaded state exceed max_pockets %d" % (regions,
