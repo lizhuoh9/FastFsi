@@ -19,6 +19,10 @@ First version of the package layout `src/fastfsi` (replaces the earlier flat lay
   (one `after_project()` per `update()`; `FASTFSI_STRICT_INVARIANTS=1` turns a violation into a hard stop).
   `PneumaticChamber` exports the contract and reports the outlet-layer divergence; `PressureRegions` reports the
   outlet-layer and interior divergence separately.
+- `OutletShiftGuard` divides by a floored shift: ratio = pre / max(shift, shift_floor), where shift_floor is the shift
+  of |p_ref| = 200 Pa on a free outlet face (`SHIFT_FLOOR_PRESSURE_PA`; reported as `outlet_guard_shift_floor_1ps`).
+  Near a zero crossing of p_ref the plain ratio exceeded the limit at the solver tolerance, so strict mode stopped
+  falsely; a real outlet defect (pre about the shift) still gives a ratio about 1.
 - Checkpoint / restart: `fastfsi.io.checkpoint` (create-only NPZ checkpoints), `fastfsi.io.restart` (checkpoint
   schedule, manifest checks), `fastfsi.io.run_segments` (joins restarted segments).
 - Turek–Hron example: `--checkpoint-every-s`, `--checkpoint-at`, `--restart-from`, `--diagnostic-restart`; argument

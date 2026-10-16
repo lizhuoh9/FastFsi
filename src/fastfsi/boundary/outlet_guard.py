@@ -26,7 +26,10 @@ THIS MODULE (one code path for every shifted-outlet chamber):
     them once and resets them.  Outlet rows checked: k = 0, i and j off the domain edges, fluid with fluid neighbours
     (four lateral, one above) and no Dirichlet diagonal (D = 0).  Measured: pre / post = max |div + s - volume_source|
     (1/s, the solver's face divergence of interior faces, the outlet face as stored), shift = max |(dt / rho) R_out|.
-    ratio = pre / shift: about the solver tolerance when the halves meet; about 1 when the solver's half was changed.
+    ratio = pre / max(shift, shift_floor): about the solver tolerance when the halves meet; about 1 when the solver's
+    half was changed.  shift_floor = (dt / rho) SHIFT_FLOOR_PRESSURE_PA 2 / dz0^2 is the shift that |p_ref| = 200 Pa
+    gives on a free outlet face (R = w 2 / dz0^2 (-p_ref), face weight w <= 1): near a zero crossing of p_ref the
+    shift goes to 0 while pre stays at the solver tolerance, and the plain pre / shift would exceed the limit.
   - Strict mode (environment FASTFSI_STRICT_INVARIANTS=1, used by the test suites): report() raises SimulationHardStop
     "outlet_shift_invariant" when ratio > INVARIANT_RATIO_MAX.  Otherwise the caller reports it (a run-time warning).
 
@@ -43,10 +46,11 @@ PROJECT_REQUIREMENTS = dict(pressure_outlet_zmin=True, pressure_solver="fv_cg", 
                             pressure_outlet_backflow_policy="allow", accumulate_pressure_into_previous=False)
 MULTIGRID_PRECONDITIONERS = frozenset(("fv_multigrid", "fv_multigrid_light"))
 STRICT_ENVIRONMENT = "FASTFSI_STRICT_INVARIANTS"
-INVARIANT_RATIO_MAX = 1.0e-2           # pre / shift; the halves meet at the solver tolerance (tests: < 1e-4)
+INVARIANT_RATIO_MAX = 1.0e-2           # pre / max(shift, floor); the halves meet at the solver tolerance (tests: < 1e-4)
+SHIFT_FLOOR_PRESSURE_PA = 200.0        # the denominator floor: the shift of |p_ref| = 200 Pa on a free outlet face
 HARD_STOP_CODES = {"outlet_shift_invariant"}
-G_PRE, G_POST, G_SHIFT, G_CALLS = 0, 1, 2, 3
-G_SLOTS = 4
+G_PRE, G_POST, G_SHIFT, G_CALLS, G_FLOOR = 0, 1, 2, 3, 4
+G_SLOTS = 5
 
 
 def merge_project_requirements(chamber, project_kwargs):
@@ -117,6 +121,8 @@ class OutletShiftGuard:
                     ti.atomic_max(self.stats[G_SHIFT], ti.abs(dt_over_rho * outlet_rhs[i, j]))
         if with_shift != 0:
             self.stats[G_CALLS] += 1.0
+            dz0 = ti.cast(self.fluid.cell_width_z_m[0], ti.f64)
+            ti.atomic_max(self.stats[G_FLOOR], dt_over_rho * SHIFT_FLOOR_PRESSURE_PA * 2.0 / (dz0 * dz0))
 
     def arm(self):
         """update(): this step's outlet rows are written; exactly one after_project() may follow."""
@@ -135,14 +141,16 @@ class OutletShiftGuard:
         self._measure_kernel(outlet_rhs, float(dt_over_rho), G_POST, 0)
 
     def report(self):
-        """Interval maxima since the last report (one device read; reset), the ratio pre / shift (None while no outlet
-        shift was applied) and the strict-mode hard stop."""
+        """Interval maxima since the last report (one device read; reset), the ratio pre / max(shift, shift_floor)
+        (None while the guard did not run) and the strict-mode hard stop."""
         s = self.stats.to_numpy()
         self.stats.fill(0.0)
         pre, post, shift, calls = float(s[G_PRE]), float(s[G_POST]), float(s[G_SHIFT]), int(s[G_CALLS])
-        ratio = pre / shift if shift > 0.0 and math.isfinite(pre) else None
+        floor = float(s[G_FLOOR])
+        scale = max(shift, floor)
+        ratio = pre / scale if scale > 0.0 and math.isfinite(pre) else None
         out = dict(outlet_guard_pre_max_1ps=pre, outlet_guard_post_max_1ps=post, outlet_guard_shift_max_1ps=shift,
-                   outlet_guard_ratio=ratio, outlet_guard_calls=calls)
+                   outlet_guard_shift_floor_1ps=floor, outlet_guard_ratio=ratio, outlet_guard_calls=calls)
         if self.strict and (not math.isfinite(pre) or (ratio is not None and ratio > INVARIANT_RATIO_MAX)):
             raise SimulationHardStop("outlet_shift_invariant", dict(out, ratio_max=INVARIANT_RATIO_MAX))
         return out

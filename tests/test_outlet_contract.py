@@ -18,7 +18,9 @@ merge_project_requirements(chamber, the same kwargs):
      the outlet at 0 and the guard ratio below the production limit;
   7. flowing duct (air directly on water): NEW's outlet stays small and decays;
   8. pressurised-chamber jet (a 2 x 2-cell hole in an obstacle plate): NEW's mean hole speed <= the ideal Bernoulli
-     speed sqrt(2 p_in / rho) (the discharge coefficient is printed); OLD's is at least 20 % faster than NEW's."""
+     speed sqrt(2 p_in / rho) (the discharge coefficient is printed); OLD's is at least 20 % faster than NEW's;
+  9. the shift floor: ratio = pre / max(shift, shift_floor) (the report arithmetic; a strict sweep of p_in through zero
+     with a pressure-independent divergence source does not stop, although the plain pre / shift exceeds the limit)."""
 import math
 
 import numpy as np
@@ -286,3 +288,61 @@ def test_jet_mean_speed_at_most_ideal_bernoulli():
     assert new_speed <= ideal
     assert abs(new_outlet) <= 0.05 * P_JET
     assert old_speed >= 1.2 * new_speed
+
+
+# ---------------------------------------------------------------------------------- 9. the shift floor (zero crossing)
+def test_guard_ratio_uses_the_shift_floor():
+    """report(): ratio = pre / max(shift, shift_floor).  Near a zero crossing of p_ref the shift is tiny and the plain
+    pre / shift would exceed the limit; a real defect (pre about the shift at a large p_ref) still gives about 1."""
+    from fastfsi.boundary.outlet_guard import G_CALLS, G_FLOOR, G_PRE, G_POST, G_SHIFT, OutletShiftGuard
+    fluid, _, _ = duct.rig()
+    guard = OutletShiftGuard(fluid, strict=True)
+
+    def report_with(pre, shift, floor):
+        values = np.zeros(guard.stats.shape, np.float64)
+        values[G_PRE], values[G_POST], values[G_SHIFT], values[G_CALLS], values[G_FLOOR] = pre, 0.0, shift, 1.0, floor
+        guard.stats.from_numpy(values)
+        return guard.report()
+
+    near_zero = report_with(pre=1.0e-3, shift=0.04, floor=1.0)              # p_ref about 0: pre / shift = 2.5e-2
+    assert near_zero["outlet_guard_ratio"] == pytest.approx(1.0e-3)
+    assert near_zero["outlet_guard_shift_floor_1ps"] == pytest.approx(1.0)
+    at_zero = report_with(pre=1.0e-3, shift=0.0, floor=1.0)                 # p_ref exactly 0: still checked
+    assert at_zero["outlet_guard_ratio"] == pytest.approx(1.0e-3)
+    with pytest.raises(SimulationHardStop) as stop:                         # the defect: pre about the shift
+        report_with(pre=0.5, shift=1.0, floor=0.1)
+    assert stop.value.code == "outlet_shift_invariant"
+
+
+def test_strict_guard_through_zero_inlet_pressure():
+    """p_in swept through zero in strict mode while a pressure-independent divergence source keeps the solver's
+    residual (pre) at its tolerance level, as a moving body or a decelerating jet does in a run (here: a random
+    velocity perturbation before every step and a loose CG tolerance).  Near zero the shift shrinks with |p_in| while
+    pre does not, so the plain pre / shift exceeds the limit (strict mode would stop); the floored ratio stays at the
+    solver level, and the ratio is defined at p_in = 0 too."""
+    fluid, _, chamber = duct.rig()
+    obstacle, codes = membrane_tank()
+    reset(fluid, chamber, obstacle, codes)
+    rng = np.random.default_rng(23)
+    kwargs = kwargs_for(chamber, "new", cg_tolerance=0.3)
+    sweep = (100.0, 1.0, 0.01, 0.001, 0.0, -0.001, -0.01, -1.0, -100.0)
+    chamber.outlet_guard.strict = True
+    plain, floored = [], []
+    try:
+        t = 0.0
+        for p_in in sweep:
+            u = fluid.velocity.to_numpy()
+            u += rng.normal(0.0, 0.01, u.shape).astype(np.float32)
+            u[obstacle != 0] = 0.0
+            fluid.velocity.from_numpy(u)
+            t = step(fluid, chamber, p_in, kwargs, t)
+            g = chamber.outlet_guard.report()                                  # strict: raises on a violation
+            assert g["outlet_guard_ratio"] is not None and g["outlet_guard_ratio"] <= INVARIANT_RATIO_MAX
+            floored.append(g["outlet_guard_ratio"])
+            if g["outlet_guard_shift_max_1ps"] > 0.0:
+                plain.append(g["outlet_guard_pre_max_1ps"] / g["outlet_guard_shift_max_1ps"])
+    finally:
+        chamber.outlet_guard.strict = False
+    print("OUTLET zero crossing: plain pre / shift max %.3e, floored ratio max %.3e (limit %.0e)"
+          % (max(plain), max(floored), INVARIANT_RATIO_MAX))
+    assert max(plain) > INVARIANT_RATIO_MAX                                   # without the floor strict mode would stop
