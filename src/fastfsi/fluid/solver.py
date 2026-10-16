@@ -796,6 +796,14 @@ class IncompressibleFluidSolver(Checkpointable, MomentumAdvection, ObstacleMask,
             dtype=ti.i32,
             shape=shape,
         )
+        # Fluid cells with active legacy coupling slots, counted once per
+        # graph build by the label init kernel: the slot passes of the label
+        # sweep and of the union-find loop over the cells only when it is
+        # nonzero.
+        self.pressure_outlet_operator_interface_slot_cell_count = ti.field(
+            dtype=ti.i32,
+            shape=(),
+        )
         self.pressure_outlet_operator_raw_component_cell_count = ti.field(
             dtype=ti.i32,
             shape=shape,

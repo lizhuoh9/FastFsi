@@ -39,6 +39,12 @@ First version of the package layout `src/fastfsi` (replaces the earlier flat lay
   solid; the others reuse the last occupancy while volumes, pressures and the stiffness check run at every refresh.
   A restart keeps the cadence bit for bit: `SolidOccupancy`'s checkpoint carries what a skipped refresh reuses (the
   coverage, the column sums and the last statistics).
+- Operator component labels by union-find (`PressureNullspace`): the outlet nullspace graph labels each exact
+  pressure-operator component by its minimum linear cell index with a lock-free union-find (one union and one
+  compression kernel over the grid faces, the interface rows or, without rows, the legacy coupling slots) and certifies
+  the labels with one min-label sweep triple, instead of iterating sweep batches until nothing changes; a label the
+  certificate changes fails the graph closed (`component_labels_not_converged`).  The labels are the same fixed point;
+  the slot passes run only when the init kernel counted slot cells.
 - Checkpoint / restart: `fastfsi.io.checkpoint` (create-only NPZ checkpoints), `fastfsi.io.restart` (checkpoint
   schedule, manifest checks), `fastfsi.io.run_segments` (joins restarted segments).
 - Turek–Hron example: `--checkpoint-every-s`, `--checkpoint-at`, `--restart-from`, `--diagnostic-restart`; argument

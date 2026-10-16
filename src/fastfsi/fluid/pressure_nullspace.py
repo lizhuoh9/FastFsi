@@ -23,7 +23,8 @@ class PressureNullspace:
     pressure_interface_row_count, pressure_interface_row_neighbor, pressure_interface_row_owner,
     pressure_interface_row_support_count, pressure_interface_row_transmissibility,
     pressure_outlet_operator_active_unanchored_component_count, pressure_outlet_operator_component_label,
-    pressure_outlet_operator_empty_singleton_component_count, pressure_outlet_operator_raw_component_anchored,
+    pressure_outlet_operator_empty_singleton_component_count, pressure_outlet_operator_interface_slot_cell_count,
+    pressure_outlet_operator_raw_component_anchored,
     pressure_outlet_operator_raw_component_cell_count, pressure_outlet_operator_raw_component_count,
     pressure_outlet_operator_raw_component_diagonal_excess_integral,
     pressure_outlet_operator_raw_component_diagonal_scale_integral,
@@ -73,10 +74,18 @@ class PressureNullspace:
     def _init_pressure_outlet_operator_component_labels_kernel(self):
         self.pressure_outlet_operator_raw_component_count[None] = 0
         self.pressure_solve_component_invalid[None] = 0
+        self.pressure_outlet_operator_interface_slot_cell_count[None] = 0
         for i, j, k in self.obstacle:
             label = 1 << 30
             if self.obstacle[i, j, k] == 0:
                 label = (i * self.ny + j) * self.nz + k
+                if self.pressure_interface_coupling_active[i, j, k] > 0:
+                    ti.atomic_add(
+                        self.pressure_outlet_operator_interface_slot_cell_count[
+                            None
+                        ],
+                        1,
+                    )
             self.pressure_outlet_operator_component_label[i, j, k] = label
             self.pressure_outlet_operator_raw_component_cell_count[i, j, k] = 0
             self.pressure_outlet_operator_raw_component_to_compact[i, j, k] = -1
@@ -292,9 +301,20 @@ class PressureNullspace:
         )
         for row in range(ti.min(row_limit, self.pressure_interface_row_capacity)):
             self._relax_pressure_outlet_operator_interface_row(row, row_limit)
-        for i, j, k in self.obstacle:
-            if row_count == 0:
-                self._relax_pressure_outlet_operator_interface_cell(i, j, k)
+        # Legacy slots act only without rows; the cell loop has no iterations
+        # unless the label init kernel counted slot cells.
+        slot_cell_limit = 0
+        if (
+            row_count == 0
+            and self.pressure_outlet_operator_interface_slot_cell_count[None] > 0
+        ):
+            slot_cell_limit = self.nx * self.ny * self.nz
+        for index in range(slot_cell_limit):
+            i = index // (self.ny * self.nz)
+            remainder = index - i * self.ny * self.nz
+            j = remainder // self.nz
+            k = remainder - j * self.nz
+            self._relax_pressure_outlet_operator_interface_cell(i, j, k)
 
     @ti.kernel
     def _jump_pressure_outlet_operator_component_labels_kernel(self):
@@ -333,11 +353,221 @@ class PressureNullspace:
         ti.atomic_add(self.reduction_count[None], changed)
 
     def _propagate_pressure_outlet_operator_labels_batch(self) -> int:
+        """COMPONENT_LABEL_BATCH_SWEEPS min-label sweep triples; returns the number of label changes.  The graph build
+        uses the union-find below; this is the iterative reference of the same fixed point."""
         self.reduction_count[None] = 0
         for _ in range(COMPONENT_LABEL_BATCH_SWEEPS):
             self._propagate_pressure_outlet_operator_grid_labels_sweep_kernel()
             self._propagate_pressure_outlet_operator_interface_labels_kernel()
             self._jump_pressure_outlet_operator_component_labels_kernel()
+        return int(self.reduction_count[None])
+
+    @ti.func
+    def _pressure_outlet_operator_label_root(self, start: ti.i32) -> ti.i32:
+        """Root of linear cell index `start` in the union-find forest stored
+        in the operator component labels.
+
+        A fluid label is the linear index of a cell of the same component and
+        never above the cell's own index, so the walk strictly decreases and
+        ends at a root (a label equal to its own index).  An index outside the
+        grid also ends the walk (no fluid label holds one after the init
+        kernel).
+        """
+        root = start
+        walking = 1
+        while walking != 0:
+            walking = 0
+            if 0 <= root < self.nx * self.ny * self.nz:
+                root_i = root // (self.ny * self.nz)
+                remainder = root - root_i * self.ny * self.nz
+                root_j = remainder // self.nz
+                root_k = remainder - root_j * self.nz
+                parent = self.pressure_outlet_operator_component_label[
+                    root_i, root_j, root_k
+                ]
+                if 0 <= parent < root:
+                    root = parent
+                    walking = 1
+        return root
+
+    @ti.func
+    def _union_pressure_outlet_operator_labels(self, a: ti.i32, b: ti.i32):
+        """Join the trees of linear cell indices `a` and `b` (lock-free
+        union-find, Playne & Hawick 2018): the larger root is linked under the
+        smaller one with an atomic minimum; if another thread linked that root
+        first, the displaced parent is joined next."""
+        first = a
+        second = b
+        merging = 1
+        while merging != 0:
+            merging = 0
+            first = self._pressure_outlet_operator_label_root(first)
+            second = self._pressure_outlet_operator_label_root(second)
+            if first != second:
+                low = ti.min(first, second)
+                high = ti.max(first, second)
+                if 0 <= low and high < self.nx * self.ny * self.nz:
+                    high_i = high // (self.ny * self.nz)
+                    remainder = high - high_i * self.ny * self.nz
+                    high_j = remainder // self.nz
+                    high_k = remainder - high_j * self.nz
+                    previous = ti.atomic_min(
+                        self.pressure_outlet_operator_component_label[
+                            high_i, high_j, high_k
+                        ],
+                        low,
+                    )
+                    if previous != high:
+                        first = low
+                        second = previous
+                        merging = 1
+
+    @ti.func
+    def _union_pressure_outlet_operator_interface_row(
+        self,
+        row: ti.i32,
+        row_limit: ti.i32,
+    ):
+        """The edge of one explicit interface row, with the filters of
+        _relax_pressure_outlet_operator_interface_row."""
+        if row < row_limit:
+            owner = self.pressure_interface_row_owner[row]
+            neighbor = self.pressure_interface_row_neighbor[row]
+            i, j, k = owner.x, owner.y, owner.z
+            ni, nj, nk = neighbor.x, neighbor.y, neighbor.z
+            transmissibility = self.pressure_interface_row_transmissibility[row]
+            if (
+                0 <= i < self.nx
+                and 0 <= j < self.ny
+                and 0 <= k < self.nz
+                and 0 <= ni < self.nx
+                and 0 <= nj < self.ny
+                and 0 <= nk < self.nz
+                and self.obstacle[i, j, k] == 0
+                and self.obstacle[ni, nj, nk] == 0
+                and not ti.math.isnan(transmissibility)
+                and not ti.math.isinf(transmissibility)
+                and transmissibility > 0.0
+                and (i != ni or j != nj or k != nk)
+            ):
+                self._union_pressure_outlet_operator_labels(
+                    (i * self.ny + j) * self.nz + k,
+                    (ni * self.ny + nj) * self.nz + nk,
+                )
+
+    @ti.func
+    def _union_pressure_outlet_operator_interface_cell(
+        self,
+        i: ti.i32,
+        j: ti.i32,
+        k: ti.i32,
+    ):
+        """The legacy coupling-slot edges of one cell, with the filters of
+        _relax_pressure_outlet_operator_interface_cell (at most
+        PRESSURE_INTERFACE_COUPLING_SLOT_COUNT slots)."""
+        active_count = self.pressure_interface_coupling_active[i, j, k]
+        if active_count > 0 and self.obstacle[i, j, k] == 0:
+            for coupling_slot in range(
+                ti.min(active_count, PRESSURE_INTERFACE_COUPLING_SLOT_COUNT)
+            ):
+                neighbor = self.pressure_interface_coupling_neighbor[i, j, k]
+                transmissibility = self.pressure_interface_coupling_coefficient[
+                    i, j, k
+                ]
+                if coupling_slot > 0:
+                    neighbor = self.pressure_interface_coupling_extra_neighbor[
+                        i, j, k, coupling_slot - 1
+                    ]
+                    transmissibility = (
+                        self.pressure_interface_coupling_extra_coefficient[
+                            i, j, k, coupling_slot - 1
+                        ]
+                    )
+                ni, nj, nk = neighbor.x, neighbor.y, neighbor.z
+                if (
+                    0 <= ni < self.nx
+                    and 0 <= nj < self.ny
+                    and 0 <= nk < self.nz
+                    and self.obstacle[ni, nj, nk] == 0
+                    and not ti.math.isnan(transmissibility)
+                    and not ti.math.isinf(transmissibility)
+                    and transmissibility > 0.0
+                    and (i != ni or j != nj or k != nk)
+                ):
+                    self._union_pressure_outlet_operator_labels(
+                        (i * self.ny + j) * self.nz + k,
+                        (ni * self.ny + nj) * self.nz + nk,
+                    )
+
+    @ti.kernel
+    def _union_pressure_outlet_operator_component_labels_kernel(self):
+        """Union-find over the exact operator graph: each grid face once (from
+        its lower cell, with the sweep's connectivity rule), the interface
+        rows, or without rows the legacy slots.  Needs the init kernel first."""
+        for i, j, k in self.obstacle:
+            if self.obstacle[i, j, k] == 0:
+                own = (i * self.ny + j) * self.nz + k
+                if i < self.nx - 1:
+                    if (
+                        self.obstacle[i + 1, j, k] == 0
+                        and self._pressure_cells_connected(i, j, k, i + 1, j, k)
+                    ):
+                        self._union_pressure_outlet_operator_labels(
+                            own, own + self.ny * self.nz
+                        )
+                if j < self.ny - 1:
+                    if (
+                        self.obstacle[i, j + 1, k] == 0
+                        and self._pressure_cells_connected(i, j, k, i, j + 1, k)
+                    ):
+                        self._union_pressure_outlet_operator_labels(
+                            own, own + self.nz
+                        )
+                if k < self.nz - 1:
+                    if (
+                        self.obstacle[i, j, k + 1] == 0
+                        and self._pressure_cells_connected(i, j, k, i, j, k + 1)
+                    ):
+                        self._union_pressure_outlet_operator_labels(own, own + 1)
+        row_count = self.pressure_interface_row_count[None]
+        row_limit = ti.max(
+            0,
+            ti.min(row_count, self.pressure_interface_row_capacity),
+        )
+        for row in range(ti.min(row_limit, self.pressure_interface_row_capacity)):
+            self._union_pressure_outlet_operator_interface_row(row, row_limit)
+        slot_cell_limit = 0
+        if (
+            row_count == 0
+            and self.pressure_outlet_operator_interface_slot_cell_count[None] > 0
+        ):
+            slot_cell_limit = self.nx * self.ny * self.nz
+        for index in range(slot_cell_limit):
+            i = index // (self.ny * self.nz)
+            remainder = index - i * self.ny * self.nz
+            j = remainder // self.nz
+            k = remainder - j * self.nz
+            self._union_pressure_outlet_operator_interface_cell(i, j, k)
+
+    @ti.kernel
+    def _compress_pressure_outlet_operator_component_labels_kernel(self):
+        """Each fluid label := its root.  Concurrent walks read either a
+        parent or the root it is replaced by, both on the same tree."""
+        for i, j, k in self.obstacle:
+            if self.obstacle[i, j, k] == 0:
+                self.pressure_outlet_operator_component_label[i, j, k] = (
+                    self._pressure_outlet_operator_label_root(
+                        (i * self.ny + j) * self.nz + k
+                    )
+                )
+
+    def _certify_pressure_outlet_operator_component_labels(self) -> int:
+        """One grid / interface / pointer-jump sweep over the labels; returns
+        the number of label changes (0 at the min-label fixed point)."""
+        self.reduction_count[None] = 0
+        self._propagate_pressure_outlet_operator_grid_labels_sweep_kernel()
+        self._propagate_pressure_outlet_operator_interface_labels_kernel()
+        self._jump_pressure_outlet_operator_component_labels_kernel()
         return int(self.reduction_count[None])
 
     @ti.kernel
@@ -798,31 +1028,24 @@ class PressureNullspace:
         )
         self._init_pressure_outlet_operator_component_labels_kernel()
         # Interface rows are non-local graph edges and can form an arbitrary
-        # chain, so a geometric grid-diameter bound is not sufficient.  The
-        # number of active cells is the finite monotone-label upper bound; the
-        # normal path still exits after the first unchanged batch.
-        propagation_sweep_budget = max(1, int(self.nx * self.ny * self.nz))
-        # A batch reports the sum of changes across all of its sweeps.  Keep
-        # one extra batch so labels that stabilize inside the last propagation
-        # batch can still produce the all-zero confirmation required here.
-        max_sweeps = (
-            propagation_sweep_budget + COMPONENT_LABEL_BATCH_SWEEPS
+        # chain.  Union-find joins every edge in one pass whatever the chain
+        # length; every link points to a smaller linear index, so after the
+        # compression each label is its component's minimum index -- the fixed
+        # point of the min-label sweeps.  One sweep triple certifies it on the
+        # device: any label change fails closed.
+        self._union_pressure_outlet_operator_component_labels_kernel()
+        self._compress_pressure_outlet_operator_component_labels_kernel()
+        certificate_changes = (
+            self._certify_pressure_outlet_operator_component_labels()
         )
-        labels_converged = False
-        label_sweeps_done = 0
-        while label_sweeps_done < max_sweeps:
-            batch_changed = self._propagate_pressure_outlet_operator_labels_batch()
-            label_sweeps_done += COMPONENT_LABEL_BATCH_SWEEPS
-            if batch_changed == 0:
-                labels_converged = True
-                break
-        if not labels_converged:
+        if certificate_changes != 0:
             fail_graph(
                 "outlet exact pressure-operator component labels are not converged",
                 reason="component_labels_not_converged",
                 count=source_physical_count,
                 labels_converged=False,
-                label_sweep_count=label_sweeps_done,
+                label_sweep_count=1,
+                certificate_label_changes=int(certificate_changes),
             )
 
         self._accumulate_pressure_outlet_operator_raw_components_kernel()
