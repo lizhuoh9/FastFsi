@@ -251,3 +251,123 @@ def test_defaults_conserve_gas_and_count_regions():
     ended = [e for e in r.events if e["kind"] == "ended"]
     assert len(ended) == 1 and ended[0]["how"] == "covered" and ended[0]["cells"] == 1
     assert ended[0]["free_volume_m3"] == pytest.approx(V, rel=1e-12)
+
+
+# ------------------------------------------------------------------------------------------------- type memory
+# The local configuration of a run's stop (a gas-side void at a wall, enclosed by a flickering rasterised surface for one
+# update, then joined to the gas by its neighbour's release): W is the void, N the neighbour released one update later,
+# G the gas cell above N.
+W, N, G = (3, 3, 5), (4, 3, 5), (4, 3, 6)
+
+
+def gas_side_void(r):
+    """Masks: the slab (W is inlet gas); W and its face neighbours material; W freed while enclosed; N freed."""
+    m0 = r.slab
+    m1 = enclose(r.slab, [W])
+    m1[W] = True
+    m2 = m1.copy()
+    m2[W] = False
+    m3 = m2.copy()
+    m3[N] = False
+    return m0, m1, m2, m3
+
+
+def test_a_gas_side_void_freed_while_enclosed_rejoins_the_gas():
+    r = rig()
+    m0, m1, m2, m3 = gas_side_void(r)
+    r.step(m0, 0.0, p_in(0))
+    assert r.device.last_free.to_numpy()[W] == 1                     # its last free code: inlet gas
+    r.step(m1, 0.1, p_in(1))
+    assert r.device.codes()[W] == 0 and r.device.last_free.to_numpy()[W] == 1
+    out2 = r.step(m2, 0.2, p_in(2))
+    assert r.device.codes()[W] == 1 and r.device.cand_id.to_numpy()[W] > 0       # a pending region of the inlet gas
+    assert out2["pockets"] == 0 and out2["candidates_pending"] == 1
+    out3 = r.step(m3, 0.3, p_in(3))                                  # N's release joins W to the gas: no stop
+    assert r.device.codes()[W] == 1 and out3["pockets"] == 0 and out3["candidates_pending"] == 0
+    c = out3["candidate_counters"]
+    assert (c["created"], c["sealed"], c["reconnected"]) == (1, 0, 1)
+
+
+def test_the_gas_side_void_stops_the_run_without_type_memory():
+    r = rig(type_memory=False)
+    m0, m1, m2, m3 = gas_side_void(r)
+    r.step(m0, 0.0, p_in(0))
+    r.step(m1, 0.1, p_in(1))
+    r.step(m2, 0.2, p_in(2))
+    assert r.device.codes()[W] == 3                                  # the old rule: freed material is a water pocket
+    with pytest.raises(SimulationHardStop) as stop:
+        r.step(m3, 0.3, p_in(3))
+    assert stop.value.code == "gas_region_liquid_to_gas"
+
+
+L, S = (3, 3, 2), (3, 3, 3)          # a liquid cell under the slab, and the slab cell above it
+
+
+def liquid_void(r):
+    """Masks: the slab (L is liquid); L and its face neighbours material; L freed while enclosed; S freed, so the gas
+    above the slab reaches L."""
+    m0 = r.slab
+    m1 = enclose(r.slab, [L])
+    m1[L] = True
+    m2 = m1.copy()
+    m2[L] = False
+    m3 = m2.copy()
+    m3[S] = False
+    return m0, m1, m2, m3
+
+
+def test_a_freed_void_with_a_liquid_history_is_a_water_pocket_and_a_true_flip_still_stops():
+    r = rig()
+    m0, m1, m2, m3 = liquid_void(r)
+    r.step(m0, 0.0, p_in(0))
+    assert r.device.last_free.to_numpy()[L] == 2
+    r.step(m1, 0.1, p_in(1))
+    r.step(m2, 0.2, p_in(2))
+    assert r.device.codes()[L] == 3                                  # liquid history: a water pocket, as before
+    with pytest.raises(SimulationHardStop) as stop:                  # gas reaches the water: still the hard stop
+        r.step(m3, 0.3, p_in(3))
+    assert stop.value.code == "gas_region_liquid_to_gas"
+
+
+def test_mixed_histories_are_ambiguous():
+    """A gas-history cell above the slab, the slab cell (never free) and a liquid-history cell below, freed together and
+    enclosed: one region with a gas and a liquid parent is gas_pocket_origin_ambiguous (the old rule: a water pocket)."""
+    column = [(3, 3, 4), S, L]
+    for memory in (True, False):
+        r = rig(type_memory=memory)
+        r.step(r.slab, 0.0, p_in(0))
+        closed = enclose(r.slab, column)
+        for cell in column:
+            closed[cell] = True
+        r.step(closed, 0.1, p_in(1))
+        opened = closed.copy()
+        for cell in column:
+            opened[cell] = False
+        if memory:
+            with pytest.raises(SimulationHardStop) as stop:
+                r.step(opened, 0.2, p_in(2))
+            assert stop.value.code == "gas_pocket_origin_ambiguous"
+        else:
+            r.step(opened, 0.2, p_in(2))
+            assert all(r.device.codes()[cell] == 3 for cell in column)
+
+
+def test_type_memory_survives_a_checkpoint_round_trip():
+    r = rig()
+    m0, m1, m2, m3 = gas_side_void(r)
+    r.step(m0, 0.0, p_in(0))
+    r.step(m1, 0.1, p_in(1))                                         # W covered, its gas history only in last_free
+    arrays = {name: r.device.state_array(name) for name in r.device.state_array_names()}
+    assert "last_free" in arrays
+    host = copy.deepcopy(r.device.state_host())
+    other = rig()
+    other.device.load_state_arrays(arrays)
+    other.device.load_state_host(host)
+    other.occ.at_update = m1.copy()
+    for n, mask in ((2, m2), (3, m3)):
+        a = r.step(mask, 0.1 * n, p_in(n))
+        b = other.step(mask, 0.1 * n, p_in(n))
+        assert np.array_equal(r.device.codes(), other.device.codes()), n
+        assert np.array_equal(r.device.last_free.to_numpy(), other.device.last_free.to_numpy()), n
+        assert a["candidate_counters"] == b["candidate_counters"], n
+    assert b["candidate_counters"]["reconnected"] == 1

@@ -43,6 +43,16 @@ sealed, ended by covered / reconnected / merged, the largest region and age, the
 ended unsealed, the largest such volume as a fraction of the inlet air) and the events (the first
 CANDIDATE_EVENT_LOG_MAX in full) are host state, checkpointed with cand_id.  seal_steps = min_cells = 1 is the
 earlier rule (every candidate sealed at once).
+TYPE MEMORY (type_memory, default on): every commit records, per box cell, the class of its last free code (field
+last_free: INLET_GAS, LIQUID or a water pocket; 0 when the cell was never free since the start, or last belonged to a
+sealed air pocket, whose number does not survive a renumbering).  A candidate cell that was material before the
+classification reports that class as its previous code, so gas_pocket_transitions types a sealed region of freed cells
+by its cells' history: a void freed on the gas side is a candidate region of the inlet gas (the sealing rule; joining
+the inlet gas again ends it as "reconnected"), a void with a liquid history is a water pocket, mixed histories are
+the hard stop gas_pocket_origin_ambiguous; cells with no history keep the old rule (a water pocket).  Without it, a
+one-cell void that a flickering rasterised surface enclosed for one update on the gas side became a water pocket and
+the next update's gas contact stopped the run (gas_region_liquid_to_gas) although gas and liquid never met.  last_free
+is checkpointed.
 RASTER INTERVAL (raster_interval N >= 1, default 1): with N > 1 only every Nth refresh re-rasterises the body
 (SolidOccupancy.update); the others reuse the last occupancy (no flips, no topology stage, no ageing) while volumes,
 pressures and the step check run at every refresh.  A restart keeps the cadence: the refresh count is carried, and
@@ -136,7 +146,7 @@ def _no_transfers():
 class DeviceGasRegions(Checkpointable):
     """Device classification and gas of a chamber box (see the module docstring)."""
 
-    CHECKPOINT_FIELDS = ("code", "q", "p_prev", "cand_id")
+    CHECKPOINT_FIELDS = ("code", "q", "p_prev", "cand_id", "last_free")
     CHECKPOINT_HOST = ("pockets", "initialized", "refreshes", "topology_changes", "host_stages", "flood_levels",
                        "exchange_pa_m3", "seal_events", "last_omega_rad_s", "last_t_s", "pocket_set_unchanged",
                        "pending_regions", "candidate_counters", "candidate_events", "raster_skips",
@@ -146,7 +156,7 @@ class DeviceGasRegions(Checkpointable):
     def __init__(self, occupancy, chamber, air_cell, wall, inlet_cells, *, ambient_pressure_pa=P_ATMOSPHERE_PA,
                  pressure_bounds_abs_pa=None, max_pockets=DEFAULT_MAX_POCKETS, flood_batch=DEFAULT_FLOOD_BATCH,
                  staging=DEFAULT_STAGING, volume_bins_m3=DEFAULT_VOLUME_BINS_M3, seal_steps=N_SEAL, min_cells=M_MIN,
-                 raster_interval=1):
+                 raster_interval=1, type_memory=True):
         shape = tuple(occupancy.shape)
         wall = np.asarray(wall, dtype=bool)
         inlet = np.asarray(inlet_cells, dtype=bool)
@@ -180,6 +190,7 @@ class DeviceGasRegions(Checkpointable):
         self.volume_bins_m3 = tuple(float(v) for v in volume_bins_m3)
         self.seal_steps, self.min_cells = int(seal_steps), int(min_cells)
         self.raster_interval = int(raster_interval)
+        self.type_memory = bool(type_memory)
         if self.seal_steps < 1 or self.min_cells < 1 or self.raster_interval < 1:
             raise ValueError("seal_steps, min_cells and raster_interval must be >= 1")
         cells = int(np.prod(shape))
@@ -190,6 +201,7 @@ class DeviceGasRegions(Checkpointable):
         self.vol = ti.field(ti.f64, shape=shape)
         self.vol.from_numpy(np.asarray(occupancy.cell_volume_m3, dtype=np.float64))
         self.code = ti.field(ti.i32, shape=shape)
+        self.last_free = ti.field(ti.i32, shape=shape)     # type memory: the class of the last free code (0 none)
         self.new_code = ti.field(ti.i32, shape=shape)
         self.reach = ti.field(ti.i32, shape=shape)
         self.cand = ti.field(ti.i32, shape=cells)
@@ -298,7 +310,7 @@ class DeviceGasRegions(Checkpointable):
                     ti.atomic_add(self.ctr[C_FRONTIER], 1)
 
     @ti.kernel
-    def _classify_kernel(self, pockets: ti.i32, regions: ti.i32):
+    def _classify_kernel(self, pockets: ti.i32, regions: ti.i32, memory: ti.i32):
         for k_ in range(pockets):
             for s in ti.static(range(4)):
                 self.fate[k_, s] = 0
@@ -324,7 +336,10 @@ class DeviceGasRegions(Checkpointable):
                     new = -1
                     slot = ti.atomic_add(self.ctr[C_CANDIDATES], 1)
                     self.cand[slot] = linear
-                    self.cand_prev[slot] = old
+                    parent = old
+                    if memory != 0 and old == 0:          # type memory: a freed cell reports its last free class
+                        parent = self.last_free[i, j, k]
+                    self.cand_prev[slot] = parent
                     self.cand_preg[slot] = old_region
                     if old < 3:
                         ti.atomic_add(self.ctr[C_NEW_CANDIDATES], 1)
@@ -414,6 +429,10 @@ class DeviceGasRegions(Checkpointable):
                 value = 3                    # a candidate that no host stage classified: water pocket (no pockets)
             self.code[I] = value
             self.cand_id[I] = self.new_cand[I]
+            if value >= 4:
+                self.last_free[I] = 0        # a sealed air pocket: its number does not survive a renumbering
+            elif value != 0:
+                self.last_free[I] = value    # INLET_GAS, LIQUID or a water pocket; material keeps the history
 
     @ti.kernel
     def _chamber_codes_kernel(self):
@@ -674,7 +693,7 @@ class DeviceGasRegions(Checkpointable):
         self._flood()
         old_pockets = self.pockets
         old_regions = len(self.pending_regions)
-        self._classify_kernel(old_pockets, old_regions)
+        self._classify_kernel(old_pockets, old_regions, int(self.type_memory))
         counters = self._read(self.ctr)
         if counters[C_LEAK]:
             self._fail("gas_region_leak", 1, counters, t_s)

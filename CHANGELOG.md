@@ -35,6 +35,14 @@ First version of the package layout `src/fastfsi` (replaces the earlier flat lay
   region from occupancy jitter used to seal and vanish two updates later: `gas_pocket_zero_volume`).  The regions and
   their counters and events are checkpointed (loading checks that the pending regions fit the region tables and that
   every cell names one of them); `seal_steps = min_cells = 1` is the earlier rule.
+- Type memory of the gas regions (`DeviceGasRegions`, `type_memory`, default on): every commit records, per box cell,
+  the class of its last free code (`last_free`: inlet gas, liquid or a water pocket; checkpointed).  A candidate cell
+  that was material reports that class as its previous code, so a sealed region of freed cells is typed by its cells'
+  history: a void freed on the gas side is a pending region of the inlet gas (the sealing rule), a void with a liquid
+  history a water pocket, mixed histories the hard stop `gas_pocket_origin_ambiguous`; cells never free keep the old
+  rule.  A one-cell gas-side void that a flickering rasterised surface enclosed for one update used to become a water
+  pocket, and the gas contact one update later stopped the run (`gas_region_liquid_to_gas`) although gas and liquid
+  never met.
 - `raster_interval` (`DeviceGasRegions`, `PneumaticChamber`; default 1): only every Nth refresh re-rasterises the
   solid; the others reuse the last occupancy while volumes, pressures and the stiffness check run at every refresh.
   A restart keeps the cadence bit for bit: `SolidOccupancy`'s checkpoint carries what a skipped refresh reuses (the

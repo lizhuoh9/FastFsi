@@ -11,7 +11,9 @@ CODES (also the device classification of boundary/gas_regions_device.py):
 COMPONENTS.  The candidate cells (free cells reached by neither flood) form 6-connected components.  Each component's
 PARENTS are the previous codes of its cells.  A component with an air parent (INLET_GAS or an air pocket) and a water parent
 (LIQUID or a water pocket) is the hard stop gas_pocket_origin_ambiguous; one without air parents is a water pocket
-(code 3; freed material counts as no parent).  A component with an old air pocket among its parents continues that
+(code 3; freed material counts as no parent, unless the device's type memory reports the class of the cell's last
+free code -- INLET_GAS, LIQUID or a water pocket -- as its previous code).  A component with an old air pocket among
+its parents continues that
 pocket lineage: it is an air pocket (new number, in the order of the components' smallest cell index, so the numbering
 is deterministic).
 
