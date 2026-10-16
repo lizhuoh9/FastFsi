@@ -114,8 +114,10 @@ def _subdivide(faces, sub):
 class SolidOccupancy(Checkpointable):
     """Material, coverage and topology of one deformable body on a box of the fluid grid (see the module docstring)."""
 
-    CHECKPOINT_FIELDS = ("topo", "age")
-    CHECKPOINT_HOST = ("updates",)
+    # the topology hysteresis, and what a refresh that skips the rasterisation (a gas-region raster interval > 1)
+    # reuses: the coverage, the column sums and the last statistics, so a restart continues the cadence bit for bit
+    CHECKPOINT_FIELDS = ("topo", "age", "coverage_field", "column_mass_field", "column_ke_field")
+    CHECKPOINT_HOST = ("updates", "last")
 
     def __init__(self, axes, box_cells, points, point_indices, reference_positions_m, spacing_m, *, sub=DEFAULT_SUB,
                  stretch_factor=DEFAULT_STRETCH_FACTOR, box_samples=DEFAULT_BOX_SAMPLES,

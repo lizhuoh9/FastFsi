@@ -45,7 +45,8 @@ CANDIDATE_EVENT_LOG_MAX in full) are host state, checkpointed with cand_id.  sea
 earlier rule (every candidate sealed at once).
 RASTER INTERVAL (raster_interval N >= 1, default 1): with N > 1 only every Nth refresh re-rasterises the body
 (SolidOccupancy.update); the others reuse the last occupancy (no flips, no topology stage, no ageing) while volumes,
-pressures and the step check run at every refresh.  The first refresh after a checkpoint load always rasterises.
+pressures and the step check run at every refresh.  A restart keeps the cadence: the refresh count is carried, and
+SolidOccupancy's checkpoint carries what a skipped refresh reuses (coverage, column sums, the last statistics).
 TRANSFERS per refresh (counted: diagnostics "transfers"): read 1 (SolidOccupancy statistics, 9 f64), read 2
 (STATS_SLOTS f64); on a topology change in addition the counters (C_SLOTS i32; they include the material cells on the
 box floor) after every `flood_batch` flood levels and after the classification, and with a host stage the candidate list
@@ -61,8 +62,8 @@ counter); strict hard stops otherwise.  p_atm is the standard atmosphere, 101325
 Guards (hard stops): gas_pocket_zero_volume (a pocket without volume), gas_pocket_invalid_pressure (non-finite or not
 positive), gas_pocket_pressure_out_of_bounds (optional absolute bounds).
 
-Design note fastfsi_dev/dev/INLET_POCKET_INTEGRATION_DESIGN_2026-10-14.md; the host-labelling reference path is
-boundary/gas_regions.GasRegions with boundary/gas_pockets.GasPocketModel (seal_from_inlet_pressure=True).
+The host-labelling reference path is boundary/gas_regions.GasRegions with boundary/gas_pockets.GasPocketModel
+(seal_from_inlet_pressure=True).
 
 No `from __future__ import annotations` (Taichi kernel module).
 """
@@ -235,7 +236,6 @@ class DeviceGasRegions(Checkpointable):
         self.candidate_events_new = []   # the events of the last refresh (for the caller; not carried)
         self.raster_skips = 0
         self.last_air_volume_m3 = None
-        self._fresh_after_load = False
         self.host_stage_s = 0.0
         self.last_omega_rad_s = 0.0
         self.last_omega_checked_rad_s = 0.0
@@ -800,8 +800,7 @@ class DeviceGasRegions(Checkpointable):
         self.transfers = _no_transfers()
         self.candidate_events_new = []
         first = not self.initialized
-        skip = (self.raster_interval > 1 and not first and not self._fresh_after_load
-                and self.refreshes % self.raster_interval != 0)
+        skip = self.raster_interval > 1 and not first and self.refreshes % self.raster_interval != 0
         if skip:                                          # raster interval: the last occupancy, no flips, no ageing
             occupancy = dict(getattr(self.occupancy, "last", None) or {}, flipped=0, rasterised=False)
             self.raster_skips += 1
@@ -814,7 +813,6 @@ class DeviceGasRegions(Checkpointable):
             if self.pending_regions:
                 self.candidate_counters["age_max"] = max(self.candidate_counters["age_max"],
                                                          max(r["age"] for r in self.pending_regions))
-        self._fresh_after_load = False
         if first:
             self.occupancy.reset_topology()
         topology = None
@@ -902,4 +900,18 @@ class DeviceGasRegions(Checkpointable):
     def _after_load_state(self):
         self._chamber_codes_kernel()
         self.chamber.pocket_count = self.pockets
-        self._fresh_after_load = True                     # raster interval: the first refresh rasterises
+
+    def load_state_host(self, values):
+        """Checkpointable.load_state_host, then the region bounds (the arrays are loaded first): the pending regions fit
+        the region tables and every cell's pending-region number names one of them; otherwise the fate and volume
+        kernels would index out of bounds.  Raises ValueError."""
+        super().load_state_host(values)
+        regions = len(self.pending_regions)
+        if regions > self.max_pockets:
+            raise ValueError("%d pending regions in the loaded state exceed max_pockets %d" % (regions,
+                                                                                            self.max_pockets))
+        cand = self.cand_id.to_numpy()
+        top, bottom = (int(cand.max()), int(cand.min())) if cand.size else (0, 0)
+        if top > regions or bottom < 0:
+            raise ValueError("cand_id holds region numbers %d .. %d but the loaded state has %d pending regions"
+                             % (bottom, top, regions))

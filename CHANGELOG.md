@@ -33,9 +33,12 @@ First version of the package layout `src/fastfsi` (replaces the earlier flat lay
   (`N_SEAL` = 5) with at least `min_cells` cells (`M_MIN` = 8); until then it stays inlet gas at the inlet pressure.
   A candidate region that is covered, reconnected or merged before it seals ends without a hard stop (a one-cell
   region from occupancy jitter used to seal and vanish two updates later: `gas_pocket_zero_volume`).  The regions and
-  their counters and events are checkpointed; `seal_steps = min_cells = 1` is the earlier rule.
+  their counters and events are checkpointed (loading checks that the pending regions fit the region tables and that
+  every cell names one of them); `seal_steps = min_cells = 1` is the earlier rule.
 - `raster_interval` (`DeviceGasRegions`, `PneumaticChamber`; default 1): only every Nth refresh re-rasterises the
   solid; the others reuse the last occupancy while volumes, pressures and the stiffness check run at every refresh.
+  A restart keeps the cadence bit for bit: `SolidOccupancy`'s checkpoint carries what a skipped refresh reuses (the
+  coverage, the column sums and the last statistics).
 - Checkpoint / restart: `fastfsi.io.checkpoint` (create-only NPZ checkpoints), `fastfsi.io.restart` (checkpoint
   schedule, manifest checks), `fastfsi.io.run_segments` (joins restarted segments).
 - Turek–Hron example: `--checkpoint-every-s`, `--checkpoint-at`, `--restart-from`, `--diagnostic-restart`; argument

@@ -35,33 +35,40 @@ def duct_grid():
                          cell_widths_y_m=(1.0e-3,) * NY, cell_widths_z_m=widths_z)
 
 
+def build(**options):
+    """A fresh duct fluid, the membrane slab and a PneumaticChamber with `options` (CPU runtime of the tests)."""
+    from cpu_runtime import initialize
+    if not _STATE.get("runtime"):
+        initialize()
+        _STATE["runtime"] = True
+    grid = duct_grid()
+    spec = FluidDomainSpecification(bounds_min_m=grid.bounds_min_m, bounds_max_m=grid.bounds_max_m,
+                                    grid_nodes=grid.grid_nodes, density_kgm3=RHO, viscosity_pa_s=MU, dt_s=DT,
+                                    cartesian_grid=grid)
+    fluid = IncompressibleFluidSolver(spec, runtime=TaichiRuntimeConfig(arch="cpu", default_fp="f32"))
+    fluid.obstacle.from_numpy(np.zeros(grid.grid_nodes, np.int32))
+    faces = [np.asarray(f) for f in (grid.cell_faces_x_m, grid.cell_faces_y_m, grid.cell_faces_z_m)]
+    top = faces[2][-1]
+    i, j, k = np.meshgrid(np.arange(16), np.arange(16), np.arange(2), indexing="ij")
+    positions = np.stack(((i.ravel() + 0.5) * S_XY, (j.ravel() + 0.5) * S_XY,
+                          top - (1.5 - k.ravel()) * S_Z), axis=1)          # layer k = 1's boxes touch the lid
+    tags = np.where(k.ravel() == 1, TAG_CHAMBER_SURFACE, 0).astype(np.int32)
+    volumes = np.full(len(positions), S_XY * S_XY * S_Z)
+    points = MaterialPoints(positions_m=positions.astype(np.float32), volumes_m3=volumes,
+                            material=NeoHookeanMaterial(1000.0, 1.0, 10.0), tether_mask=np.zeros(len(positions)),
+                            tag=tags)
+    chamber = PneumaticChamber(fluid, GradedAxes(*faces), points, body_indices=np.arange(len(positions)),
+                               reference_positions_m=positions,
+                               spacing_m=np.tile([S_XY, S_XY, S_Z], (len(positions), 1)),
+                               point_mass_kg=volumes * 1040.0, axis_xy_m=(4.0e-3, 4.0e-3), radius_m=3.5e-3,
+                               lid_z_m=top, box_z_lo_m=0.99, inlet_centre_xy_m=(4.0e-3, 4.0e-3),
+                               inlet_diameter_m=2.0e-3, **dict(dict(hysteresis_steps=3, staging=1024), **options))
+    return dict(fluid=fluid, points=points, chamber=chamber, positions=positions)
+
+
 def rig():
     if "chamber" not in _STATE:
-        from cpu_runtime import initialize
-        initialize()
-        grid = duct_grid()
-        spec = FluidDomainSpecification(bounds_min_m=grid.bounds_min_m, bounds_max_m=grid.bounds_max_m,
-                                        grid_nodes=grid.grid_nodes, density_kgm3=RHO, viscosity_pa_s=MU, dt_s=DT,
-                                        cartesian_grid=grid)
-        fluid = IncompressibleFluidSolver(spec, runtime=TaichiRuntimeConfig(arch="cpu", default_fp="f32"))
-        fluid.obstacle.from_numpy(np.zeros(grid.grid_nodes, np.int32))
-        faces = [np.asarray(f) for f in (grid.cell_faces_x_m, grid.cell_faces_y_m, grid.cell_faces_z_m)]
-        top = faces[2][-1]
-        i, j, k = np.meshgrid(np.arange(16), np.arange(16), np.arange(2), indexing="ij")
-        positions = np.stack(((i.ravel() + 0.5) * S_XY, (j.ravel() + 0.5) * S_XY,
-                              top - (1.5 - k.ravel()) * S_Z), axis=1)          # layer k = 1's boxes touch the lid
-        tags = np.where(k.ravel() == 1, TAG_CHAMBER_SURFACE, 0).astype(np.int32)
-        volumes = np.full(len(positions), S_XY * S_XY * S_Z)
-        points = MaterialPoints(positions_m=positions.astype(np.float32), volumes_m3=volumes,
-                                material=NeoHookeanMaterial(1000.0, 1.0, 10.0), tether_mask=np.zeros(len(positions)),
-                                tag=tags)
-        chamber = PneumaticChamber(fluid, GradedAxes(*faces), points, body_indices=np.arange(len(positions)),
-                                     reference_positions_m=positions,
-                                     spacing_m=np.tile([S_XY, S_XY, S_Z], (len(positions), 1)),
-                                     point_mass_kg=volumes * 1040.0, axis_xy_m=(4.0e-3, 4.0e-3), radius_m=3.5e-3,
-                                     lid_z_m=top, box_z_lo_m=0.99, inlet_centre_xy_m=(4.0e-3, 4.0e-3),
-                                     inlet_diameter_m=2.0e-3, hysteresis_steps=3, staging=1024)
-        _STATE.update(points=points, chamber=chamber, positions=positions)
+        _STATE.update(build())
     return _STATE
 
 
@@ -132,3 +139,71 @@ def test_lagged_gas_spring_frequency_and_stability():
     assert abs(ratio - 1.0) < 0.02 and growth < 1.2                  # (omega dt)^2 / 24: under 1 %; no growth
     _, _, growth = lagged_gas_spring(2.2, 2000)
     assert growth > 1.0e3                                            # beyond omega dt = 2: unstable
+
+
+def accept_sequence(s, accepts, *, save_after=None, path=None):
+    """Accept n = 0 with the slab at rest, then n >= 1 with it 1.5 mm down; per accept the covered flag, the pocket
+    count, the air cells, the region codes, the topology, the occupancy updates and the raster skips."""
+    from fastfsi.io.checkpoint import write_checkpoint
+    points, chamber, positions = s["points"], s["chamber"], s["positions"]
+    out = []
+    for n in accepts:
+        move(points, positions, 0.0 if n == 0 else -1.5e-3)
+        r = chamber.accept(1.0e-3 * n, 0.0, dt_taken_s=None if n == 0 else 1.0e-4)
+        out.append((r["inlet_covered"], r["pockets"], chamber.air_cell.to_numpy().copy(),
+                    chamber.regions.codes().copy(), chamber.occupancy.topo.to_numpy().copy(),
+                    chamber.occupancy.updates, chamber.regions.raster_skips))
+        if save_after == n:
+            write_checkpoint(path, dict(chamber=chamber), dict(accept=n), dict(rig="pneumatic duct"))
+    return out
+
+
+def same_states(a, b):
+    return all(x[0] == y[0] and x[1] == y[1] and x[5] == y[5] and x[6] == y[6] and np.array_equal(x[2], y[2])
+               and np.array_equal(x[3], y[3]) and np.array_equal(x[4], y[4]) for x, y in zip(a, b)) and len(a) == len(b)
+
+
+def test_raster_interval_two_restart_at_a_skipped_refresh_is_bitwise(tmp_path):
+    """raster_interval = 2 (refresh 1 rasterises, then every 2nd): a straight run of 11 accepts and a run checkpointed
+    through fastfsi.io.checkpoint (NPZ + host JSON) after accept 2, whose next refresh skips the rasterisation, then
+    restored into a fresh chamber, agree bit for bit: the checkpoint carries what a skipped refresh reuses and the
+    restored run keeps the cadence (the slab moving down passes the hysteresis and the inlet reconnects)."""
+    from fastfsi.io.checkpoint import load_components, read_checkpoint
+    straight = accept_sequence(build(raster_interval=2), range(11))
+    path = tmp_path / "raster.npz"
+    first = accept_sequence(build(raster_interval=2), range(3), save_after=2, path=path)
+    assert same_states(first, straight[:3])
+    restored = build(raster_interval=2)
+    arrays, host, loop_state, _, _ = read_checkpoint(path)
+    load_components(dict(chamber=restored["chamber"]), arrays, host)
+    assert loop_state == dict(accept=2) and restored["chamber"].regions.refreshes % 2 == 1
+    after = accept_sequence(restored, range(3, 11))
+    assert same_states(after, straight[3:])
+    assert straight[-1][6] == 5                                               # skipped at accepts 1, 3, 5, 7, 9
+    assert [state[0] for state in straight] != [straight[0][0]] * 11          # the inlet reconnects in the window
+
+
+def test_sealing_rule_options_pass_through_and_the_candidate_events_drain():
+    s = build(seal_steps=3, min_cells=2, raster_interval=2)
+    chamber = s["chamber"]
+    assert (chamber.regions.seal_steps, chamber.regions.min_cells, chamber.regions.raster_interval) == (3, 2, 2)
+    original = chamber.regions.refresh
+
+    def refresh(*args, **kwargs):                                    # one candidate event per refresh, as reported
+        out = original(*args, **kwargs)
+        out["candidate_events_new"] = [dict(kind="created", census_id=chamber.regions.refreshes)]
+        return out
+
+    chamber.regions.refresh = refresh
+    move(s["points"], s["positions"], 0.0)
+    chamber.accept(0.0, 0.0)
+    chamber.accept(1.0e-3, 0.0, dt_taken_s=1.0e-4)
+    assert [e["census_id"] for e in chamber.drain_candidate_events()] == [1, 2]
+    assert chamber.drain_candidate_events() == []                    # drained: the buffer does not grow
+    summary = chamber.run_summary()
+    assert (summary["seal_steps"], summary["min_cells"], summary["raster_interval"]) == (3, 2, 2)
+    assert summary["raster_skips"] == 1 and summary["candidates_pending_at_end"] == 0
+    assert summary["candidate_counters"]["created"] == 0 and summary["candidate_events"] == []
+    report = chamber.report()
+    assert {"candidates_pending", "candidate_cells_pending", "candidate_counters", "raster_skips"} <= set(report)
+    assert report["raster_skips"] == 1

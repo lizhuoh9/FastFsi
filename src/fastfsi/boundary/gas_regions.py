@@ -22,8 +22,6 @@ the component sums change continuously while the coverage changes, except at rea
 
 DIRICHLET CODES for the pressure chamber: 0 = no Dirichlet value (water, material, water pockets), 1 = air connected
 to an inlet (the inlet pressure at the solve), 2 + n = air pocket n (its own gas pressure, a table from the gas model).
-
-Design note: fastfsi_dev/dev/INLET_POCKET_INTEGRATION_DESIGN_2026-10-14.md sections 1.3, 1.4, 2 and 4.2.
 """
 from __future__ import annotations
 

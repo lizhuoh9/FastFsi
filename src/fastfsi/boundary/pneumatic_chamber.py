@@ -34,8 +34,6 @@ off from the inlet seals; until then it is inlet air.  raster_interval N re-rast
 TRANSFERS: see gas_regions_device (two reads under 1 KB without flips); while the inlet is covered one more 8-byte
 read (the covering area) per accept.  The run totals are in run_summary()["transfers"].
 
-Design note fastfsi_dev/dev/INLET_POCKET_INTEGRATION_DESIGN_2026-10-14.md.
-
 No `from __future__ import annotations` (Taichi kernel module).
 """
 import math

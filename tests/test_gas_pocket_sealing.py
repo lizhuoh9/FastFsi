@@ -151,6 +151,54 @@ def test_checkpoint_round_trip_while_a_region_is_pending():
     assert other.device.pocket_table()["q_pa_m3"][0] == r.device.pocket_table()["q_pa_m3"][0]
 
 
+def test_real_checkpoint_round_trip_while_a_region_is_pending(tmp_path):
+    """The same continuation through fastfsi.io.checkpoint (NPZ arrays + the encoded host JSON), not an in-memory copy:
+    the pending region, its counters and the seal update and gas survive the file."""
+    from fastfsi.io.checkpoint import load_components, read_checkpoint, write_checkpoint
+    r = rig()
+    outs = run_block(r, 3)
+    assert outs[-1]["candidates_pending"] == 1
+    path = tmp_path / "pending.npz"
+    write_checkpoint(path, dict(regions=r.device), dict(refresh=3), dict(rig="sealing"))
+    arrays, host, loop_state, manifest, _ = read_checkpoint(path)
+    other = rig()
+    load_components(dict(regions=other.device), arrays, host)
+    assert loop_state == dict(refresh=3) and manifest == dict(rig="sealing")
+    assert other.device.pending_regions == r.device.pending_regions
+    assert other.device.candidate_counters == r.device.candidate_counters
+    sealed = enclose(r.slab, BLOCK)
+    other.occ.at_update = sealed.copy()
+    for n in (4, 5):
+        a = r.step(sealed, 0.1 * n, p_in(n))
+        b = other.step(sealed, 0.1 * n, p_in(n))
+        assert a["pockets"] == b["pockets"] and np.array_equal(r.device.codes(), other.device.codes()), n
+    assert b["pockets"] == 1
+    assert other.device.pocket_table()["q_pa_m3"][0] == r.device.pocket_table()["q_pa_m3"][0]
+
+
+def test_loading_impossible_regions_is_refused():
+    """load_state_host checks the region bounds: more pending regions than the region tables hold, or a cell naming a
+    region beyond the pending ones, raise ValueError (the fate and volume kernels would index out of bounds)."""
+    r = rig()
+    run_block(r, 3)
+    arrays = {name: r.device.state_array(name) for name in r.device.state_array_names()}
+    host = copy.deepcopy(r.device.state_host())
+    assert len(host["pending_regions"]) == 1
+    too_many = copy.deepcopy(host)
+    too_many["pending_regions"] = [dict(host["pending_regions"][0]) for _ in range(r.device.max_pockets + 1)]
+    other = rig()
+    other.device.load_state_arrays(arrays)
+    with pytest.raises(ValueError, match="pending regions"):
+        other.device.load_state_host(too_many)
+    beyond = dict(arrays)
+    beyond["cand_id"] = arrays["cand_id"].copy()
+    beyond["cand_id"][tuple(BLOCK[0])] = 2                           # region 2 while only 1 is pending
+    third = rig()
+    third.device.load_state_arrays(beyond)
+    with pytest.raises(ValueError, match="cand_id"):
+        third.device.load_state_host(host)
+
+
 def test_raster_interval_two_ages_on_rasterised_refreshes_only():
     r = rig(raster_interval=2)
     r.step(r.slab, 0.0, p_in(0))                                     # refresh 1 rasterises (the first)
