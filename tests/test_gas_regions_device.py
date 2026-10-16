@@ -15,7 +15,7 @@ import taichi as ti
 from fastfsi.boundary.gas_regions import INLET_GAS as REF_AIR
 from fastfsi.boundary.gas_regions import LIQUID as REF_WATER
 from fastfsi.boundary.gas_regions import GasRegions
-from fastfsi.boundary.gas_regions_device import STATS_SLOTS, P_ATMOSPHERE_PA, DeviceGasRegions
+from fastfsi.boundary.gas_regions_device import STAGE_ROWS, STATS_SLOTS, P_ATMOSPHERE_PA, DeviceGasRegions
 from fastfsi.boundary.gas_pockets import GasPocketModel, PressureInlet
 from fastfsi.errors import SimulationHardStop
 
@@ -98,7 +98,8 @@ class Pair:
         self.occ = FakeOccupancy()
         self.chamber = FakeChamber()
         self.air_cell = ti.field(ti.i32, shape=SHAPE)
-        options = dict(dict(max_pockets=64, flood_batch=4, staging=8), **options)
+        # seal_steps = min_cells = 1: the earlier rule (every candidate seals at once), as the host reference path
+        options = dict(dict(max_pockets=64, flood_batch=4, staging=8, seal_steps=1, min_cells=1), **options)
         self.device = DeviceGasRegions(self.occ, self.chamber, self.air_cell, wall, inlet, **options)
         self.regions = GasRegions(np.full(SHAPE, V), wall, inlet)
         self.gas = GasPocketModel(np.full(SHAPE, V), [PressureInlet(inlet, P_IN)], ambient_pressure_pa=P_ATMOSPHERE_PA,
@@ -310,7 +311,7 @@ def test_transfers_scale_with_the_counts():
     pair.compare(c, ref)
     x = out["transfers"]
     assert out["topology"]["host_stage"] and x["writes"] == 2           # the candidates' codes and the new gas
-    assert x["write_bytes"] == 2 * 256 * 4 + 5 * 64 * 8
+    assert x["write_bytes"] == STAGE_ROWS * 256 * 4 + 5 * 64 * 8         # index, code, region rows
     assert x["read_bytes"] < 8 * 1024
     out, c, ref = pair.step(sealed, 0.2)                                # the same mask: no flip
     pair.compare(c, ref)

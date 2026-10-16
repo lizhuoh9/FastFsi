@@ -23,6 +23,14 @@ First version of the package layout `src/fastfsi` (replaces the earlier flat lay
   of |p_ref| = 200 Pa on a free outlet face (`SHIFT_FLOOR_PRESSURE_PA`; reported as `outlet_guard_shift_floor_1ps`).
   Near a zero crossing of p_ref the plain ratio exceeded the limit at the solver tolerance, so strict mode stopped
   falsely; a real outlet defect (pre about the shift) still gives a ratio about 1.
+- Sealing rule of the gas regions (`DeviceGasRegions`, `PneumaticChamber`; `seal_steps`, `min_cells`): a region cut
+  off from the inlet gas becomes a sealed pocket only after it persisted `seal_steps` occupancy updates
+  (`N_SEAL` = 5) with at least `min_cells` cells (`M_MIN` = 8); until then it stays inlet gas at the inlet pressure.
+  A candidate region that is covered, reconnected or merged before it seals ends without a hard stop (a one-cell
+  region from occupancy jitter used to seal and vanish two updates later: `gas_pocket_zero_volume`).  The regions and
+  their counters and events are checkpointed; `seal_steps = min_cells = 1` is the earlier rule.
+- `raster_interval` (`DeviceGasRegions`, `PneumaticChamber`; default 1): only every Nth refresh re-rasterises the
+  solid; the others reuse the last occupancy while volumes, pressures and the stiffness check run at every refresh.
 - Checkpoint / restart: `fastfsi.io.checkpoint` (create-only NPZ checkpoints), `fastfsi.io.restart` (checkpoint
   schedule, manifest checks), `fastfsi.io.run_segments` (joins restarted segments).
 - Turek–Hron example: `--checkpoint-every-s`, `--checkpoint-at`, `--restart-from`, `--diagnostic-restart`; argument

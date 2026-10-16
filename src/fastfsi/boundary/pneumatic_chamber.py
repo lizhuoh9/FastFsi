@@ -27,6 +27,10 @@ PER STEP (driver):
     after_project(dt, p_in(t_mid))
     ... midpoint correct -> the accepted geometry ...
     accept(t_new, dt_taken)          occupancy, topology (on flips), volumes, pressures, the rows of the next step
+POCKET RULE (gas_regions_device): seal_steps (default N_SEAL = 5) and min_cells (M_MIN = 8) decide when a region cut
+off from the inlet seals; until then it is inlet air.  raster_interval N re-rasterises the body every Nth accept only
+(default 1).  The candidate events wait in candidate_events_pending until the driver drains them
+(drain_candidate_events()).
 TRANSFERS: see gas_regions_device (two reads under 1 KB without flips); while the inlet is covered one more 8-byte
 read (the covering area) per accept.  The run totals are in run_summary()["transfers"].
 
@@ -39,6 +43,7 @@ import math
 import numpy as np
 import taichi as ti
 
+from fastfsi.boundary.gas_pocket_transitions import M_MIN, N_SEAL
 from fastfsi.boundary.gas_pockets import P_ATMOSPHERE_PA
 from fastfsi.boundary.gas_regions_device import DeviceGasRegions
 from fastfsi.boundary.solid_occupancy import (DEFAULT_BOX_SAMPLES, DEFAULT_HYSTERESIS_STEPS, DEFAULT_STRETCH_FACTOR,
@@ -88,7 +93,7 @@ class PneumaticChamber:
                  stretch_factor=DEFAULT_STRETCH_FACTOR, box_samples=DEFAULT_BOX_SAMPLES,
                  hysteresis_steps=DEFAULT_HYSTERESIS_STEPS, penalty_factor=DEFAULT_PENALTY_FACTOR,
                  inlet_traction=True, surface_tag=TAG_CHAMBER_SURFACE, max_pockets=4096, flood_batch=16,
-                 staging=65536):
+                 staging=65536, seal_steps=N_SEAL, min_cells=M_MIN, raster_interval=1):
         faces = tuple(np.asarray(f, dtype=np.float64) for f in axes.faces_m)
         box = chamber_box(faces, axis_xy_m, float(radius_m), float(box_z_lo_m), float(lid_z_m))
         self.fluid = fluid
@@ -128,7 +133,9 @@ class PneumaticChamber:
         self.regions = DeviceGasRegions(self.occupancy, self.chamber, self.air_cell, wall, inlet,
                                         ambient_pressure_pa=ambient_pressure_pa,
                                         pressure_bounds_abs_pa=pressure_bounds_abs_pa, max_pockets=max_pockets,
-                                        flood_batch=flood_batch, staging=staging)
+                                        flood_batch=flood_batch, staging=staging, seal_steps=seal_steps,
+                                        min_cells=min_cells, raster_interval=raster_interval)
+        self.candidate_events_pending = []      # candidate-region events until the driver drains them (not carried)
         self.area = ti.field(ti.f64, shape=self.occupancy.n_body)
         self.area_total = ti.field(ti.f64, shape=())
         self.covered = False
@@ -236,6 +243,7 @@ class PneumaticChamber:
         run["topology_accepts"] += int(topology is not None)
         run["host_stage_accepts"] += int(bool(topology and topology.get("host_stage")))
         self.last = dict(diagnostics, inlet_covered=self.covered, traction_steps=self.traction_steps, transfers=step)
+        self.candidate_events_pending.extend(dict(e) for e in diagnostics.get("candidate_events_new") or [])
         return dict(self.last)
 
     def run_summary(self):
@@ -250,7 +258,17 @@ class PneumaticChamber:
                     flood_levels=regions.flood_levels, traction_steps=self.traction_steps,
                     pockets_at_end=regions.pockets, inlet_covered_at_end=self.covered,
                     transfers=dict(self.transfer_run), noise_event_refreshes=self.noise_event_refreshes,
-                    noise_event_pockets=self.noise_event_pockets, noise_events=[dict(e) for e in self.noise_events])
+                    noise_event_pockets=self.noise_event_pockets, noise_events=[dict(e) for e in self.noise_events],
+                    seal_steps=regions.seal_steps, min_cells=regions.min_cells,
+                    raster_interval=regions.raster_interval, raster_skips=regions.raster_skips,
+                    candidate_counters=dict(regions.candidate_counters),
+                    candidate_events=[dict(e) for e in regions.candidate_events],
+                    candidates_pending_at_end=len(regions.pending_regions))
+
+    def drain_candidate_events(self):
+        """The candidate-region events since the last drain (created / sealed / ended), then cleared."""
+        out, self.candidate_events_pending = self.candidate_events_pending, []
+        return out
 
     def _floor_material(self):
         """Material cells on the box floor: counted by the classification of a topology change (unchanged otherwise)."""
@@ -290,7 +308,10 @@ class PneumaticChamber:
                     exchange_pa_m3=last.get("exchange_pa_m3"), transfers=last.get("transfers"),
                     transfer_run=dict(self.transfer_run), topology_changes=self.regions.topology_changes,
                     host_stages=self.regions.host_stages, pocket_set_unchanged=self.regions.pocket_set_unchanged,
-                    noise_event_refreshes=self.noise_event_refreshes, noise_event_pockets=self.noise_event_pockets)
+                    noise_event_refreshes=self.noise_event_refreshes, noise_event_pockets=self.noise_event_pockets,
+                    candidates_pending=last.get("candidates_pending"),
+                    candidate_cells_pending=last.get("candidate_cells_pending"),
+                    candidate_counters=last.get("candidate_counters"), raster_skips=last.get("raster_skips"))
 
     # checkpoint: the sub-components' state under prefixes
     def _parts(self):
