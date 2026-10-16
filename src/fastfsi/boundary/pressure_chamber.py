@@ -313,7 +313,8 @@ class ColumnPressureChamber(Checkpointable):
         self.footprint_columns = int(footprint.sum())
         self.air_cell = ti.field(ti.i32, shape=shape)
         self.outlet_rhs = ti.field(ti.f64, shape=shape[:2])      # this module's copy of R at k = 0
-        self.outlet_guard = OutletShiftGuard(fluid)               # exactly once + the outlet invariant
+        # exactly once + the outlet invariant + the projection contract of the class
+        self.outlet_guard = OutletShiftGuard(fluid, requirements=type(self).PROJECT_REQUIREMENTS)
         self.stats = ti.field(ti.f64, shape=STATS_SLOTS)
         self.stats.fill(0.0)
         self._physical_pressure = None

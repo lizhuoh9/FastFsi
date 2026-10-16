@@ -32,6 +32,11 @@ THIS MODULE (one code path for every shifted-outlet chamber):
     shift goes to 0 while pre stays at the solver tolerance, and the plain pre / shift would exceed the limit.
   - Strict mode (environment FASTFSI_STRICT_INVARIANTS=1, used by the test suites): report() raises SimulationHardStop
     "outlet_shift_invariant" when ratio > INVARIANT_RATIO_MAX.  Otherwise the caller reports it (a run-time warning).
+  - The contract check (always on; one host comparison per step, no device access): a guard built with the chamber's
+    `requirements` checks in before() that the last project() since update() ran with them (the solver records the
+    contract arguments of every call: fluid.project_calls, fluid.last_project_contract) and raises ValueError
+    otherwise, so a caller that dropped the merge cannot run the outlet with the solver's defaults.
+    `verify_contract = False` switches it off (the tests that reproduce the defect on purpose).
 
 No `from __future__ import annotations` (Taichi kernel module).
 """
@@ -74,11 +79,25 @@ def merge_project_requirements(chamber, project_kwargs):
     return merged
 
 
+def contract_violations(requirements, used):
+    """The (key, required, used) triples where the projection arguments `used` break `requirements` (the multigrid
+    preconditioner family is one value, as in merge_project_requirements)."""
+    out = []
+    for key, value in requirements.items():
+        actual = used.get(key)
+        if (key == "cg_preconditioner" and value in MULTIGRID_PRECONDITIONERS
+                and actual in MULTIGRID_PRECONDITIONERS):
+            continue
+        if actual != value:
+            out.append((key, value, actual))
+    return out
+
+
 @ti.data_oriented
 class OutletShiftGuard:
     """See the module docstring."""
 
-    def __init__(self, fluid, *, strict=None):
+    def __init__(self, fluid, *, strict=None, requirements=None):
         self.fluid = fluid
         self.shape = tuple(int(v) for v in fluid.grid.grid_nodes)
         if self.shape[2] < 2:
@@ -87,6 +106,9 @@ class OutletShiftGuard:
         self.stats.fill(0.0)
         self.armed = False
         self.strict = (os.environ.get(STRICT_ENVIRONMENT, "") == "1") if strict is None else bool(strict)
+        self.requirements = dict(requirements) if requirements else None
+        self.verify_contract = True
+        self.project_calls_at_arm = None
 
     @ti.func
     def _checkable(self, i, j):
@@ -127,14 +149,30 @@ class OutletShiftGuard:
     def arm(self):
         """update(): this step's outlet rows are written; exactly one after_project() may follow."""
         self.armed = True
+        self.project_calls_at_arm = int(getattr(self.fluid, "project_calls", 0))
 
     def before(self, outlet_rhs, dt_over_rho):
-        """Start of after_project(): consume the arming (raises without it) and measure the solver's half."""
+        """Start of after_project(): consume the arming (raises without it), check the contract of the projection that
+        ran since update() and measure the solver's half."""
         if not self.armed:
             raise RuntimeError("after_project() without a preceding update(): the outlet face term would be applied "
                                "twice to one projection")
         self.armed = False
+        if self.verify_contract and self.requirements:
+            self._verify_contract()
         self._measure_kernel(outlet_rhs, float(dt_over_rho), G_PRE, 1)
+
+    def _verify_contract(self):
+        """The last project() since update() ran with the chamber's contract (host values only)."""
+        calls = int(getattr(self.fluid, "project_calls", 0))
+        if self.project_calls_at_arm is None or calls <= self.project_calls_at_arm:
+            return                                            # no projection since update(): nothing to check
+        used = getattr(self.fluid, "last_project_contract", None) or {}
+        wrong = contract_violations(self.requirements, used)
+        if wrong:
+            raise ValueError("project() ran without the shifted outlet's projection contract: %s; merge the chamber's "
+                             "PROJECT_REQUIREMENTS into the project() arguments (merge_project_requirements)"
+                             % ", ".join("%s=%r (required %r)" % (key, actual, value) for key, value, actual in wrong))
 
     def after(self, outlet_rhs, dt_over_rho):
         """End of after_project(): measure the outlet rows after the chamber's half."""

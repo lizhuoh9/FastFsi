@@ -73,7 +73,8 @@ class PressureRegions(Checkpointable):
         self.r_jump = ti.field(ti.f64, shape=shape)
         self.outlet_rhs = ti.field(ti.f64, shape=shape[:2])
         self.stats = ti.field(ti.f64, shape=STATS_SLOTS)
-        self.outlet_guard = OutletShiftGuard(fluid)               # exactly once + the outlet invariant
+        # exactly once + the outlet invariant + the projection contract of the class
+        self.outlet_guard = OutletShiftGuard(fluid, requirements=type(self).PROJECT_REQUIREMENTS)
         self.pocket_count = 0
         self.last_p_in_pa = None
         self.last_t_s = None

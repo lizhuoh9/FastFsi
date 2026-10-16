@@ -10,7 +10,10 @@ merge_project_requirements(chamber, the same kwargs):
      without one and on a conflict; pneumatic_chamber re-exports it;
   2. still tank (closed obstacle membrane, inlet air above at p_in = +-4500 Pa): NEW keeps the outlet layer and the
      water at 0 within 1e-6 |p_in| and the air at p_in; OLD puts the tank near -p_in;
-  3. guard: OLD's ratio is about 1 and strict mode raises "outlet_shift_invariant"; NEW's ratio is below 1e-4;
+  3. guard: OLD's ratio is about 1 and strict mode raises "outlet_shift_invariant"; NEW's ratio is below 1e-4
+     (the OLD runs switch the guard's contract check off: they reproduce the defect on purpose);
+  3b. the contract check: after_project() after a project() without the contract raises ValueError (the solver records
+     the contract arguments of every call), with the contract it passes;
   4. exactly once: a second after_project() for one update() raises;
   5. idempotent projections: two consecutive update -> project -> after_project with nothing changed leave the outlet
      faces and pressure unchanged (NEW); OLD's outlet pressure changes;
@@ -52,6 +55,8 @@ def own_duct_rig():
 
 def kwargs_for(chamber, mode, **override):
     base = dict(DRIVER_KWARGS, **override)
+    # OLD reproduces the defect on purpose: the guard's contract check (on by default) would refuse its projections
+    chamber.outlet_guard.verify_contract = mode != "old"
     return base if mode == "old" else merge_project_requirements(chamber, base)
 
 
@@ -156,6 +161,54 @@ def test_still_tank_old_kwargs_reproduce_the_minus_p_in_tank_and_trip_the_guard(
         assert stop.value.witness["outlet_guard_ratio"] > 0.5
     finally:
         chamber.outlet_guard.strict = False
+
+
+# ------------------------------------------------------------------------------------------- 3b. the contract check
+def test_after_project_refuses_a_projection_without_the_contract():
+    """The guard's contract check is on by default: after_project() following a project() with the solver's defaults
+    (backflow 'clamp') raises and names the broken key; the same step with the merged contract passes; a conflicting
+    preconditioner is refused and the multigrid family accepted; with no project() since update() there is nothing to
+    check."""
+    fluid, _, chamber = duct.rig()
+    obstacle, codes = membrane_tank()
+    reset(fluid, chamber, obstacle, codes)
+    assert chamber.outlet_guard.requirements == PROJECT_REQUIREMENTS
+    chamber.outlet_guard.verify_contract = True
+    chamber.update(0.5 * duct.DT, P_JET)
+    fluid.project(dt_s=duct.DT, **DRIVER_KWARGS)                          # the caller dropped the merge
+    with pytest.raises(ValueError, match="pressure_outlet_backflow_policy='clamp' \\(required 'allow'\\)"):
+        chamber.after_project(duct.DT, P_JET)
+    reset(fluid, chamber, obstacle, codes)
+    merged = merge_project_requirements(chamber, DRIVER_KWARGS)
+    chamber.update(0.5 * duct.DT, P_JET)
+    fluid.project(dt_s=duct.DT, **merged)
+    chamber.after_project(duct.DT, P_JET)                                 # the contract: no error
+    assert fluid.last_project_contract["pressure_outlet_backflow_policy"] == "allow"
+    # a conflicting value and the multigrid family, through the record the solver keeps of a call (this graded duct
+    # admits only the FV solvers and no pressure accumulation, so the record stands in for those projections)
+    for preconditioner, refused in (("jacobi", True), ("fv_multigrid_light", False)):
+        reset(fluid, chamber, obstacle, codes)
+        chamber.update(0.5 * duct.DT, P_JET)
+        fluid.project_calls += 1
+        fluid.last_project_contract = dict(PROJECT_REQUIREMENTS, cg_preconditioner=preconditioner)
+        if refused:
+            with pytest.raises(ValueError, match="cg_preconditioner='jacobi' \\(required 'fv_multigrid'\\)"):
+                chamber.after_project(duct.DT, P_JET)
+        else:
+            chamber.after_project(duct.DT, P_JET)                         # the multigrid family is one value
+    reset(fluid, chamber, obstacle, codes)
+    chamber.update(0.5 * duct.DT, P_JET)
+    chamber.after_project(duct.DT, P_JET)                                 # no projection since update()
+
+
+def test_the_solver_records_the_contract_arguments_of_every_projection():
+    fluid, _, chamber = duct.rig()
+    obstacle, codes = membrane_tank()
+    reset(fluid, chamber, obstacle, codes)
+    calls = fluid.project_calls
+    step(fluid, chamber, P_JET, kwargs_for(chamber, "new"), 0.0)
+    assert fluid.project_calls == calls + 1
+    assert fluid.last_project_contract == PROJECT_REQUIREMENTS
 
 
 # ------------------------------------------------------------------------------------------------- 4. exactly once

@@ -1694,6 +1694,10 @@ class IncompressibleFluidSolver(Checkpointable, MomentumAdvection, ObstacleMask,
             "l2": 0.0,
             "count": 0,
         }
+        # project() calls and the projection-contract arguments of the last one (host only): a shifted-outlet
+        # chamber's after_project() checks them (boundary/outlet_guard.py)
+        self.project_calls = 0
+        self.last_project_contract = None
         self.last_project_cg_project_calls = 0
         self.last_project_cg_iterations_total = 0
         self.last_project_cg_operator_apply_count = 0
@@ -2771,6 +2775,14 @@ class IncompressibleFluidSolver(Checkpointable, MomentumAdvection, ObstacleMask,
         homogenize_pressure_interface_rhs_for_increment: bool = False,
         pressure_velocity_nullspace_projector: object | None = None,
     ) -> dict[str, float]:
+        self.project_calls += 1
+        self.last_project_contract = {
+            "pressure_outlet_zmin": bool(pressure_outlet_zmin),
+            "pressure_solver": pressure_solver,
+            "cg_preconditioner": cg_preconditioner,
+            "pressure_outlet_backflow_policy": pressure_outlet_backflow_policy,
+            "accumulate_pressure_into_previous": bool(accumulate_pressure_into_previous),
+        }
         iterations = _validated_count(
             iterations,
             name="iterations",

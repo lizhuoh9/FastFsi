@@ -23,6 +23,11 @@ First version of the package layout `src/fastfsi` (replaces the earlier flat lay
   of |p_ref| = 200 Pa on a free outlet face (`SHIFT_FLOOR_PRESSURE_PA`; reported as `outlet_guard_shift_floor_1ps`).
   Near a zero crossing of p_ref the plain ratio exceeded the limit at the solver tolerance, so strict mode stopped
   falsely; a real outlet defect (pre about the shift) still gives a ratio about 1.
+- The projection contract is checked where it acts: `IncompressibleFluidSolver.project()` records the contract
+  arguments of every call (`project_calls`, `last_project_contract`), and the outlet guard of a shifted-outlet chamber
+  raises `ValueError` in `after_project()` when the projection since `update()` ran without the chamber's
+  `PROJECT_REQUIREMENTS` (one host comparison per step, no device access; `verify_contract = False` only for tests
+  that reproduce the defect on purpose).
 - Sealing rule of the gas regions (`DeviceGasRegions`, `PneumaticChamber`; `seal_steps`, `min_cells`): a region cut
   off from the inlet gas becomes a sealed pocket only after it persisted `seal_steps` occupancy updates
   (`N_SEAL` = 5) with at least `min_cells` cells (`M_MIN` = 8); until then it stays inlet gas at the inlet pressure.
