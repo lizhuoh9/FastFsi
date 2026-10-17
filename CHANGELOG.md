@@ -56,6 +56,13 @@ First version of the package layout `src/fastfsi` (replaces the earlier flat lay
   the labels with one min-label sweep triple, instead of iterating sweep batches until nothing changes; a label the
   certificate changes fails the graph closed (`component_labels_not_converged`).  The labels are the same fixed point;
   the slot passes run only when the init kernel counted slot cells.
+- Position-based correction of the solid stress (`fastfsi.coupling.lattice_stress.LatticeStress`, the coupler's
+  `lattice_stress`, default None = the point stress alone, as before): the reference-lattice cells of a body
+  (`fastfsi.solid.reference_lattice`, factored out of the solid occupancy: 8 corner points, 6 Kuhn tetrahedra) give F
+  from the points' actual positions, and the nodal forces of its INCOMPATIBLE part (the same neo-Hookean law at the
+  lattice F minus at the corners' mean point F; volumetric part per cell: mean dilatation) enter the spread through the
+  point-force path.  Zero for any motion the point F follows; two points that drift apart with F unchanged (no energy in
+  the point stress) are pulled back.
 - Checkpoint / restart: `fastfsi.io.checkpoint` (create-only NPZ checkpoints), `fastfsi.io.restart` (checkpoint
   schedule, manifest checks), `fastfsi.io.run_segments` (joins restarted segments).
 - Turek–Hron example: `--checkpoint-every-s`, `--checkpoint-at`, `--restart-from`, `--diagnostic-restart`; argument

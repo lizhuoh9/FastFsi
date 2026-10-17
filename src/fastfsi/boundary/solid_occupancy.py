@@ -37,13 +37,14 @@ chosen by replaying stored deformed states with the factors 2, 3 and 5.
 
 No `from __future__ import annotations` (Taichi kernel module).
 """
-import itertools
 import math
 
 import numpy as np
 import taichi as ti
 
 from fastfsi.io.checkpoint import Checkpointable
+from fastfsi.solid.reference_lattice import (ADJACENCY_RTOL, KEY_QUANTUM_M, TETS, kuhn_tetrahedra,  # noqa: F401
+                                            reference_lattice_cells)
 
 DEFAULT_SUB = 3
 DEFAULT_STRETCH_FACTOR = 3.0
@@ -51,57 +52,11 @@ DEFAULT_BOX_SAMPLES = 5
 DEFAULT_HYSTERESIS_STEPS = 5
 INSIDE_TOLERANCE = 1.0e-6          # local-coordinate tolerance (f32): a centre on a shared face belongs to both primitives
 DEGENERATE_RELATIVE = 1.0e-12      # |current volume| below this x |reference volume|: the tetrahedron is skipped
-KEY_QUANTUM_M = 1.0e-8             # reference lattice coordinates are identified to 10 nm
 AABB_MARGIN_M = 1.0e-9             # candidate boxes grow by this much: a centre exactly on a face is never lost to rounding
-ADJACENCY_RTOL = 1.0e-6            # consecutive lattice coordinates must be (s_a + s_b) / 2 apart to this tolerance
 # statistics slots (one f64 field, read once per update)
 S_BOXES_SINGULAR, S_CELLS_DROPPED, S_CELLS_INVERTED, S_TETS_DEGENERATE = 0, 1, 2, 3
 S_MATERIAL_CELLS, S_TOPO_CELLS, S_FLIPPED, S_UNION_VOLUME, S_V0J = 4, 5, 6, 7, 8
 STATS_SLOTS = 9
-
-
-def kuhn_tetrahedra():
-    """The 6 Kuhn tetrahedra of a cell as corner numbers c = 4 di + 2 dj + dk (paths 000 -> e_a -> e_a + e_b -> 111)."""
-    tets = []
-    for perm in itertools.permutations(range(3)):
-        corner, path = [0, 0, 0], [0]
-        for axis in perm:
-            corner[axis] = 1
-            path.append(4 * corner[0] + 2 * corner[1] + corner[2])
-        tets.append(tuple(path))
-    return tuple(tets)
-
-
-TETS = kuhn_tetrahedra()
-
-
-def reference_lattice_cells(reference_positions_m, spacing_m):
-    """Host setup: the reference-lattice cells whose 8 corners are points.  Returns (cells (H, 8) int64 of point numbers,
-    corner c = 4 di + 2 dj + dk, and the count of candidate cells refused because two consecutive lattice coordinates
-    are not (s_a + s_b) / 2 apart).  Points must sit on a tensor-product lattice (one point per lattice index)."""
-    positions = np.asarray(reference_positions_m, dtype=np.float64)
-    spacing = np.asarray(spacing_m, dtype=np.float64)
-    if positions.ndim != 2 or positions.shape[1] != 3 or spacing.shape != positions.shape:
-        raise ValueError("reference positions and spacing must both be (n, 3)")
-    if not (np.isfinite(positions).all() and np.isfinite(spacing).all() and (spacing > 0.0).all()):
-        raise ValueError("reference positions must be finite and spacings finite and positive")
-    keys = np.round(positions / KEY_QUANTUM_M).astype(np.int64)
-    unique = [np.unique(keys[:, axis]) for axis in range(3)]
-    index = np.stack([np.searchsorted(unique[axis], keys[:, axis]) for axis in range(3)], axis=1)
-    table = np.full(tuple(len(u) for u in unique), -1, dtype=np.int64)
-    table[index[:, 0], index[:, 1], index[:, 2]] = np.arange(len(positions))
-    if int((table >= 0).sum()) != len(positions):
-        raise ValueError("two points share a reference lattice index")
-    nx, ny, nz = table.shape
-    corners = np.stack([table[di:di + nx - 1, dj:dj + ny - 1, dk:dk + nz - 1].ravel()
-                        for di, dj, dk in itertools.product((0, 1), repeat=3)], axis=1)
-    corners = corners[np.all(corners >= 0, axis=1)]
-    adjacent = np.ones(len(corners), dtype=bool)
-    for axis, (low, high) in enumerate(((0, 4), (0, 2), (0, 1))):
-        gap = positions[corners[:, high], axis] - positions[corners[:, low], axis]
-        want = 0.5 * (spacing[corners[:, low], axis] + spacing[corners[:, high], axis])
-        adjacent &= np.abs(gap - want) <= ADJACENCY_RTOL * want
-    return corners[adjacent], int((~adjacent).sum())
 
 
 def _subdivide(faces, sub):

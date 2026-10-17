@@ -24,6 +24,11 @@ within SUPPORT_REACH of an invalid face, after every mask refresh.  Further phys
 separate diagnostics pass; the stress is computed inside the spread kernel; the caller may clear the force field in a
 fused pass (spread_force(clear=False)); the inner node loops are dynamic by default (unroll_static=True unrolls all 64).
 
+Solid stress source (lattice_stress, coupling.lattice_stress): None (the default) spreads the point stress tau(F) of every
+point as above.  A LatticeStress adds the nodal forces of the reference-lattice tetrahedra's incompatible deformation
+(position-based F against the corners' point F) to the point force (point_force w, at the spread positions); the point
+stress stays.  The nodal forces are recomputed at the start of every spread.
+
 Clamp: clamp="penalty" pulls tethered points back to their anchors with stiffness tether_stiffness_pa_per_m;
 clamp="direct" makes them a rigid clamp by direct forcing (coupling.direct_forcing.DirectForcingClamp), applied at the
 end of every spread.
@@ -78,9 +83,13 @@ class ImmersedBoundaryCoupler(ExcessMassCouplerMixin, Checkpointable):
 
     def __init__(self, *, fluid, weights, mask, points, tether_stiffness_pa_per_m, interior_shortcut=True,
                  unroll_static=False, clamp="penalty", clamp_density_kgm3=None, fluid_density_kgm3=None,
-                 excess_mass_mode="auto", excess_mass_omega_rad_s=None, cfl_elastic=.3):
+                 excess_mass_mode="auto", excess_mass_omega_rad_s=None, cfl_elastic=.3, lattice_stress=None):
         self.fluid = fluid
         self.weights = weights
+        if lattice_stress is not None and lattice_stress.points is not points:
+            raise ValueError("the lattice stress must belong to the coupler's points")
+        self.lattice_stress = lattice_stress      # None: the point stress only
+        self.has_lattice = lattice_stress is not None                       # compile-time choice of _spread_kernel
         self.mask = mask
         self.points = points
         self.n = points.n
@@ -203,6 +212,8 @@ class ImmersedBoundaryCoupler(ExcessMassCouplerMixin, Checkpointable):
             point_force = pull + load_scale * self.points.f_ext[p] + self.points.f_extra[p]
             if ti.static(self.excess_mass_enabled):
                 point_force += ti.cast(self.excess_mass.spring_force[p], ti.f32)
+            if ti.static(self.has_lattice):
+                point_force += self.lattice_stress.force[p]
             self.points.f_extra[p] = ti.Vector([0.0, 0.0, 0.0])
             interior = 0
             if ti.static(self.interior_shortcut):
@@ -448,6 +459,8 @@ class ImmersedBoundaryCoupler(ExcessMassCouplerMixin, Checkpointable):
             self.excess_mass.prepare_force(dt_s)
         if clear:
             self._clear_force_kernel(self.fluid.force)
+        if self.lattice_stress is not None:
+            self.lattice_stress.compute(self.points.mu, self.points.kappa)
         self._spread_kernel(self.fluid.force, self.tether_k, float(load_scale), self.points.mu, self.points.kappa)
         if self.clamp is not None:
             self.clamp.apply(dt_s)
