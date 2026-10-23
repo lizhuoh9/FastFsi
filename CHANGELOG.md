@@ -71,11 +71,14 @@ First version of the package layout `src/fastfsi` (replaces the earlier flat lay
   backward-Euler step in q solves the law (in closed form while the hose is laminar, by bisection otherwise);
   pockets seal and reopen at p_chamber and their gas leaves or joins q (a ledger q − q₀ = inflow − exchange); a
   covered inlet has no flow, and an inlet region without volume falls back to
-  the line pressure (counted and logged).  `inlet_gauge_pa(t, p_line)` gives the step's inlet pressure (the line's,
-  or p_chamber), which the driver passes to `update`, the covered-inlet traction and `after_project`.  The region is
+  the line pressure (counted and logged); a region back from no volume restarts at the line pressure,
+  q = (p_line + p_atm) V (counted, in the ledger).  `inlet_gauge_pa(t, p_line)` gives the step's inlet pressure (the
+  line's, or p_chamber), which the driver passes to `update` and `after_project`; a covered hole carries the line
+  pressure with either model (no flow, no drop: `inlet_traction_gauge_pa`, the covered-inlet traction).  The region is
   a gas spring like a pocket: ω = sqrt(p_abs A² / (V m)) from the opt-in inlet-spring sums of
-  `DeviceGasRegions(inlet_spring=True)` joins `dt_limit()`.  Its state is checkpointed; a non-positive absolute
-  pressure is the hard stop `inlet_air_invalid_pressure`.
+  `DeviceGasRegions(inlet_spring=True)` joins `dt_limit()`.  Its state is checkpointed with the line's parameters
+  (`line_config`: a, b, Q_cap, V_line, the elements), and a chamber with the other inlet model or another line refuses
+  the checkpoint; a non-positive absolute pressure is the hard stop `inlet_air_invalid_pressure`.
 - Checkpoint / restart: `fastfsi.io.checkpoint` (create-only NPZ checkpoints), `fastfsi.io.restart` (checkpoint
   schedule, manifest checks), `fastfsi.io.run_segments` (joins restarted segments).
 - Turek–Hron example: `--checkpoint-every-s`, `--checkpoint-at`, `--restart-from`, `--diagnostic-restart`; argument

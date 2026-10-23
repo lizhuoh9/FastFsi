@@ -4,9 +4,10 @@ under the lid covers the 2 mm inlet, moves 1.5 mm down, and the inlet reconnects
     inlet's report and summary carry no capped keys;
 the region's gas spring: area and footprint mass > 0 once the inlet is open, omega = sqrt(p A^2 / (V m)) and
     dt_limit() = min(the pocket bound, 0.9 x 0.5 / omega);
-the covered start with no inlet air falls back to the line pressure (counted), and the state survives a checkpoint (with
-    a connector's bore before the lid hole: the chamber composes the series line; line elements need the capped
-    inlet)."""
+the covered start with no inlet air falls back to the line pressure (counted) and the region, once it has volume, starts
+    at the line pressure; a covered hole carries the LINE pressure (traction p_line A_hole); the state survives a
+    checkpoint (with a connector's bore before the lid hole: the chamber composes the series line; line elements need
+    the capped inlet), and an ideal chamber or one with another line refuses it (Root's review 2026-10-23)."""
 import json
 import math
 
@@ -62,6 +63,8 @@ def test_the_inlet_region_is_a_gas_spring_in_dt_limit():
     assert first["inlet_covered"] and first["inlet_air_volume_m3"] == 0.0 and first["inlet_fallbacks"] == 0
     assert first["p_chamber_gauge_pa"] == line(0.0) and first["inlet_omega_rad_s"] == 0.0
     assert out[1][5]["inlet_covered"] and out[1][5]["inlet_fallback"]      # covered with no volume: the fallback
+    back = next(n for n, x in enumerate(out) if x[5]["inlet_reappearances"])  # the region's first volume: at the
+    assert out[back][5]["p_chamber_gauge_pa"] == pytest.approx(line(STEP * back), abs=1e-6)   # line, not a vacuum
     open_ = [x[5] for x in out if not x[0]]
     assert open_, "the inlet must reconnect in the window"
     r = open_[-1]
@@ -75,6 +78,23 @@ def test_the_inlet_region_is_a_gas_spring_in_dt_limit():
     summary = chamber.run_summary()["inlet_air"]
     assert summary["kind"] == "capped" and summary["hole_length_m"] == 7.0e-3
     assert summary["fallbacks"] >= 1                                       # the covered accepts before reconnection
+
+
+def test_a_covered_hole_carries_the_line_pressure():
+    """Root's review: with Q = 0 there is no drop along the line, so the traction on a covered hole is p_line A_hole,
+    not the capped region's p_chamber."""
+    s = build(inlet_model="capped", inlet_hole_length_m=7.0e-3, inlet_flow_cap_m3_s=8.0e-3 / 60.0,
+              inlet_line_elements=(CONNECTOR,))
+    points, chamber = s["points"], s["chamber"]
+    move(points, s["positions"], 0.0)
+    assert chamber.accept(0.0, line(0.0))["inlet_covered"]                 # the covered start
+    t_mid = 0.5 * STEP
+    p_hole = chamber.inlet_traction_gauge_pa(t_mid, line)
+    assert p_hole == line(t_mid) != chamber.inlet_gauge_pa(t_mid, line)    # the hole: the line; the region: its state
+    before = points.f_extra.to_numpy()[:, 2].astype(np.float64).sum()
+    assert chamber.apply_inlet_traction(p_hole)
+    after = points.f_extra.to_numpy()[:, 2].astype(np.float64).sum()
+    assert after - before == pytest.approx(-p_hole * chamber.inlet_area_m2, rel=1e-5)
 
 
 def test_the_capped_state_survives_a_checkpoint(tmp_path):
@@ -96,8 +116,13 @@ def test_the_capped_state_survives_a_checkpoint(tmp_path):
     json.dumps(host, allow_nan=False)                                      # the checkpoint header's rule
     path = tmp_path / "capped.npz"
     write_checkpoint(path, dict(chamber=first["chamber"]), dict(accept=5), dict(rig="capped duct"))
-    restored = build(**options)
     arrays, host, _, _, _ = read_checkpoint(path)
+    with pytest.raises(ValueError, match="ideal inlet"):                    # an ideal chamber refuses a capped state
+        build()["chamber"].load_state_host(host["chamber"])
+    hole_only = build(**dict(options, inlet_line_elements=()))
+    with pytest.raises(ValueError, match="inlet line"):                     # and a capped one with another line
+        hole_only["chamber"].load_state_host(host["chamber"])
+    restored = build(**options)
     load_components(dict(chamber=restored["chamber"]), arrays, host)
     points, chamber, positions = restored["points"], restored["chamber"], restored["positions"]
     for n in range(6, 10):

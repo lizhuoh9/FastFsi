@@ -29,13 +29,20 @@ Q = sign(D) 2|D| / ((s a + c) + sqrt((s a + c)^2 + 4 s b |D|)) (b = 0: the linea
 Re = 2300 at that root only adds resistance, and the root is bisected below it.  Then |Q| <= Q_cap (Q_capped
 otherwise), q = q' + p_atm dt Q and p_chamber = q / V - p_atm.  The step is stable for any time constant
 V / (p_atm dQ/dp); the fluid solve uses the state's p_chamber (lagged by at most half a step).
-COVERED (no free inlet cell): Q = 0 and q is kept (the pending air under the membrane is closed).  With no gas volume at
-all (V = 0 with V_line = 0) p_chamber falls back to p_line: the line pressure acts through the hole; every fallback is
-counted and the first FALLBACK_LOG_MAX are logged.
+COVERED (no free inlet cell): Q = 0 and q is kept (the pending air under the membrane is closed); the covered hole
+itself carries the LINE pressure (no flow, no drop along the line: PneumaticChamber.inlet_traction_gauge_pa).  With no
+gas volume at all (V = 0 with V_line = 0) p_chamber falls back to p_line: the line pressure acts through the hole; every
+fallback is counted and the first FALLBACK_LOG_MAX are logged.  REAPPEARANCE (Root's review 2026-10-23): a region that
+has volume again after a step (or a start) without it restarts in equilibrium with the line, q = (p_line + p_atm) V --
+the hole's gas sat at p_line while nothing flowed -- instead of the near-vacuum its empty gas amount would give; the gas
+set so is counted (reappear_pa_m3, in the ledger) and the first FALLBACK_LOG_MAX events are logged.
 POCKETS: a region sealing off the inlet air takes its gas from q and a share reopening to it returns its gas
 (gas_pocket_transitions.allocate_pocket_gas's exchange, evaluated at p_atm + p_chamber).
-LEDGER: inflow = sum p_atm Q dt and exchange = sum of the pocket exchanges; q - q_0 = inflow - exchange to round-off.
+LEDGER: inflow = sum p_atm Q dt, exchange = sum of the pocket exchanges and reappear = the gas set at reappearances;
+q - q_0 = inflow - exchange + reappear to round-off.
 GUARD: a non-finite or non-positive absolute pressure of the capped region is the hard stop inlet_air_invalid_pressure.
+CHECKPOINT: the state carries the line's parameters (line_config: a, b, Q_cap, V_line, the elements); a model with
+another line refuses it.
 """
 import math
 from dataclasses import dataclass
@@ -227,7 +234,8 @@ class InletAirModel:
     HOST_FIELDS = ("q_pa_m3", "q0_pa_m3", "p_gauge_pa", "volume_m3", "q_m3_s", "capped", "covered", "fallback",
                    "inflow_pa_m3", "exchange_pa_m3", "steps", "capped_steps", "covered_steps", "fallbacks",
                    "fallback_events", "q_capped_max_m3_s", "p_min_gauge_pa", "p_max_gauge_pa", "regime",
-                   "turbulent_steps", "transition_steps", "loss_scale", "mach", "mach_max")
+                   "turbulent_steps", "transition_steps", "loss_scale", "mach", "mach_max", "reappearances",
+                   "reappear_pa_m3", "reappear_events")
 
     def __init__(self, kind="ideal", *, hole_a_pa_s_m3=0.0, hole_b_pa_s2_m6=0.0, restriction=None,
                  flow_cap_m3_s=math.inf, line_volume_m3=0.0, ambient_pa=P_ATMOSPHERE_PA):
@@ -271,6 +279,9 @@ class InletAirModel:
         self.turbulent_steps = 0
         self.transition_steps = 0
         self.fallback_events = []
+        self.reappearances = 0
+        self.reappear_pa_m3 = 0.0
+        self.reappear_events = []
         self.q_capped_max_m3_s = 0.0
         self.p_min_gauge_pa = None
         self.p_max_gauge_pa = None
@@ -278,6 +289,13 @@ class InletAirModel:
     @property
     def is_capped(self):
         return self.kind == "capped"
+
+    def line_config(self):
+        """The line's parameters a checkpoint must match (JSON-ready: no inf, lists)."""
+        return dict(kind=self.kind, a_pa_s_m3=self.hole_a, b_pa_s2_m6=self.hole_b,
+                    flow_cap_m3_s=self.flow_cap_m3_s if math.isfinite(self.flow_cap_m3_s) else None,
+                    line_volume_m3=self.line_volume_m3, ambient_pa=self.ambient_pa,
+                    elements=[[e.name, e.kind, e.diameter_m, e.length_m] for e in self.restriction.elements])
 
     def describe(self):
         """The model's parameters (run_meta / setup report)."""
@@ -321,6 +339,14 @@ class InletAirModel:
         q = self.q_pa_m3 - exchange
         self.exchange_pa_m3 += exchange
         volume = float(air_volume_m3) + self.line_volume_m3
+        if volume > 0.0 and not self.volume_m3 > 0.0:         # back after a step (or a start) without volume:
+            q_set = (p_line + self.ambient_pa) * volume        # the hole's gas sat at p_line while nothing flowed
+            self.reappear_pa_m3 += q_set - q
+            self.reappearances += 1
+            if len(self.reappear_events) < FALLBACK_LOG_MAX:
+                self.reappear_events.append(dict(time_s=t_s, p_line_gauge_pa=p_line, volume_m3=volume,
+                                                 q_before_pa_m3=q, covered=bool(covered)))
+            q = q_set
         flow, capped, fallback, regime, scale = 0.0, False, False, "laminar", 1.0
         if not volume > 0.0:
             fallback = True                         # no gas volume: the line pressure acts through the hole
@@ -375,28 +401,37 @@ class InletAirModel:
         return None if self.q_pa_m3 is None else density_kg_m3 * self.q_pa_m3 / self.ambient_pa
 
     def ledger(self):
-        """q - q_0 against inflow - exchange (Pa m^3) and the residual."""
+        """q - q_0 against inflow - exchange + reappear (Pa m^3) and the residual."""
         if self.q_pa_m3 is None:
             return None
         change = self.q_pa_m3 - self.q0_pa_m3
         return dict(q_change_pa_m3=change, inflow_pa_m3=self.inflow_pa_m3, exchange_pa_m3=self.exchange_pa_m3,
-                    residual_pa_m3=change - (self.inflow_pa_m3 - self.exchange_pa_m3))
+                    reappear_pa_m3=self.reappear_pa_m3,
+                    residual_pa_m3=change - (self.inflow_pa_m3 - self.exchange_pa_m3 + self.reappear_pa_m3))
 
     def summary(self):
         return dict(self.describe(), steps=self.steps, capped_steps=self.capped_steps,
                     covered_steps=self.covered_steps, fallbacks=self.fallbacks,
                     turbulent_steps=self.turbulent_steps, transition_steps=self.transition_steps,
-                    mach_max=self.mach_max,
-                    fallback_events=[dict(e) for e in self.fallback_events], q_capped_max_m3_s=self.q_capped_max_m3_s,
+                    mach_max=self.mach_max, reappearances=self.reappearances,
+                    fallback_events=[dict(e) for e in self.fallback_events],
+                    reappear_events=[dict(e) for e in self.reappear_events], q_capped_max_m3_s=self.q_capped_max_m3_s,
                     p_min_gauge_pa=self.p_min_gauge_pa, p_max_gauge_pa=self.p_max_gauge_pa, ledger=self.ledger(),
                     mass_kg=self.mass_kg())
 
     def state_host(self):
         values = {name: getattr(self, name) for name in self.HOST_FIELDS}
         values["fallback_events"] = [dict(e) for e in self.fallback_events]
+        values["reappear_events"] = [dict(e) for e in self.reappear_events]
+        values["line_config"] = self.line_config()
         return values
 
     def load_state_host(self, values):
+        """The state of a checkpoint written with the same line (else ValueError: a run cannot change its line)."""
+        if values.get("line_config") != self.line_config():
+            raise ValueError("the checkpoint's inlet line %s is not this model's %s"
+                             % (values.get("line_config"), self.line_config()))
         for name in self.HOST_FIELDS:
             setattr(self, name, values[name])
         self.fallback_events = [dict(e) for e in values["fallback_events"]]
+        self.reappear_events = [dict(e) for e in values["reappear_events"]]

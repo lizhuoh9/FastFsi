@@ -144,6 +144,46 @@ def test_no_volume_falls_back_to_the_line_pressure_and_is_logged():
     assert not model.fallback and model.fallbacks == 1
 
 
+def test_a_region_back_from_no_volume_restarts_at_the_line_pressure():
+    model = InletAirModel("capped", restriction=SeriesRestriction([HOLE]), flow_cap_m3_s=CAP)
+    model.start(1.0e3, 0.0)                                       # a covered start without inlet air
+    model.advance(3.0e-5, 2.5e3, 0.0, True, 0.0, t_s=0.1)          # still none: the fallback
+    assert model.fallback and model.reappearances == 0 and model.q_pa_m3 == 0.0
+    p = model.advance(3.0e-5, 3.0e3, 1.0e-5, False, 0.0, t_s=0.2)  # back: at the line, not near vacuum
+    assert p == pytest.approx(3.0e3, abs=1e-9 * P0) and abs(model.q_m3_s) < 1e-12
+    assert model.reappearances == 1 and model.reappear_events == [dict(
+        time_s=0.2, p_line_gauge_pa=3.0e3, volume_m3=1.0e-5, q_before_pa_m3=0.0, covered=False)]
+    model.advance(3.0e-5, 3.5e3, 0.0, True, 0.0)                  # gone again, then back while covered
+    p = model.advance(3.0e-5, -1.5e3, 2.0e-5, True, 0.0)
+    assert p == pytest.approx(-1.5e3, abs=1e-9 * P0) and model.reappearances == 2
+    for n in range(50):                                           # an ordinary run on: no more reappearances
+        model.advance(3.0e-5, 4.0e3, 2.0e-5, n < 10, 0.0)
+    ledger = model.ledger()
+    assert model.reappearances == 2 and ledger["reappear_pa_m3"] > 0.0
+    assert abs(ledger["residual_pa_m3"]) <= 1e-12 * model.q_pa_m3
+
+
+def test_a_checkpoint_of_another_line_is_refused():
+    model = InletAirModel("capped", restriction=SeriesRestriction([HOLE]), flow_cap_m3_s=CAP)
+    model.start(0.0, 2.0e-5)
+    model.advance(3.0e-5, 5.0e3, 2.0e-5, False, 0.0)
+    host = json.loads(json.dumps(model.state_host(), allow_nan=False))
+    assert host["line_config"]["elements"] == [["lid hole", "hole", 2.0e-3, 7.0e-3]]
+    connector = FlowElement("connector bore", "fitting", 1.5e-3)
+    for other in (InletAirModel("capped", restriction=SeriesRestriction([connector, HOLE]), flow_cap_m3_s=CAP),
+                  InletAirModel("capped", restriction=SeriesRestriction([HOLE]), flow_cap_m3_s=2.0 * CAP),
+                  InletAirModel("capped", restriction=SeriesRestriction([HOLE]), flow_cap_m3_s=CAP,
+                                line_volume_m3=1.0e-6)):
+        with pytest.raises(ValueError, match="inlet line"):
+            other.load_state_host(host)
+        assert other.q_pa_m3 is None                              # refused before anything was loaded
+    same = InletAirModel("capped", restriction=SeriesRestriction([HOLE]), flow_cap_m3_s=CAP)
+    same.load_state_host(host)
+    assert same.state_host() == model.state_host()
+    with pytest.raises(ValueError, match="inlet line"):          # a state without its line
+        same.load_state_host({k: v for k, v in host.items() if k != "line_config"})
+
+
 def test_a_non_positive_absolute_pressure_is_a_hard_stop():
     model = InletAirModel("capped", hole_a_pa_s_m3=LID_HOLE[0], hole_b_pa_s2_m6=LID_HOLE[1], flow_cap_m3_s=CAP)
     model.start(0.0, 1.0e-5)
@@ -198,8 +238,10 @@ def test_the_lid_hole_alone_as_a_series_line_is_the_hole_law_bit_for_bit():
     reference = InletAirModel("capped", hole_a_pa_s_m3=LID_HOLE[0], hole_b_pa_s2_m6=LID_HOLE[1], flow_cap_m3_s=CAP)
     for m in (model, reference):
         m.start(0.0, 2.0e-5)
-    def physics(m):                                  # the Mach log needs the geometry: the coefficients have none
-        return {k: v for k, v in m.state_host().items() if not k.startswith("mach")}
+    def physics(m):                                  # the Mach log and the line's elements need the geometry: the
+        return {k: v for k, v in m.state_host().items() if not k.startswith(("mach", "line_config"))}   # coefficients
+    lines = [m.line_config() for m in (model, reference)]                                                # have none
+    assert [(c["a_pa_s_m3"], c["b_pa_s2_m6"]) for c in lines] == [LID_HOLE, LID_HOLE]
     for n in range(60):
         for m in (model, reference):
             m.advance(3.0e-5, 25.0e3 * math.sin(0.2 * n), 2.0e-5, n % 13 == 0, 0.0)

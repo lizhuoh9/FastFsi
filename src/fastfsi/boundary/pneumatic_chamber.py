@@ -39,7 +39,8 @@ p_line - p_chamber = a Q + b Q|Q| from inlet_line_elements -- the passages betwe
 order -- and the lid hole's diameter and length (SeriesRestriction; the hole alone by default); the free-flow cap
 |Q| <= Q_cap, an optional line volume).  The driver takes the step's inlet pressure from
 inlet_gauge_pa(t_mid, p_line) -- the line pressure (ideal) or the region's p_chamber (capped) -- and passes it to
-update / apply_inlet_traction / after_project as before; accept() still receives the LINE pressure at t_new: with the
+update / after_project as before; apply_inlet_traction takes inlet_traction_gauge_pa (a covered hole carries the line
+pressure with either model: no flow, no drop); accept() still receives the LINE pressure at t_new: with the
 capped inlet the topology stage seals and reopens pockets at p_chamber (their gas exchange leaves or joins q), then the
 flow step runs at the accepted volume (air_volume_m3, the INLET_GAS cells' free volume, pending candidate regions
 included, + the line volume) with Q = 0 while the inlet is covered.  The region is a gas spring like a pocket: its
@@ -238,6 +239,12 @@ class PneumaticChamber:
         return True
 
     # ------------------------------------------------------------------------------------------------ protocol
+    def inlet_traction_gauge_pa(self, t_s, p_line_fn):
+        """The pressure on a covered hole's area for the step solved at t_s: the LINE pressure p_line_fn(t_s) with
+        either inlet model -- a covered hole carries no flow, so its gas has no drop along the line (Root's review
+        2026-10-23; the capped region's p_chamber is not the hole's pressure)."""
+        return p_line_fn(t_s)
+
     def inlet_gauge_pa(self, t_s, p_line_fn):
         """The inlet air's gauge pressure for the step solved at t_s: the line pressure p_line_fn(t_s) (ideal) or the
         capped region's pressure (the state of the last accept)."""
@@ -325,7 +332,8 @@ class PneumaticChamber:
                     inlet_capped_steps=model.capped_steps, inlet_fallback=model.fallback,
                     inlet_fallbacks=model.fallbacks, inlet_exchange_pa_m3=float(exchange_pa_m3),
                     inlet_ledger_residual_pa_m3=ledger["residual_pa_m3"],
-                    inlet_turbulent_steps=model.turbulent_steps, inlet_transition_steps=model.transition_steps)
+                    inlet_turbulent_steps=model.turbulent_steps, inlet_transition_steps=model.transition_steps,
+                    inlet_reappearances=model.reappearances)
 
     def run_summary(self):
         """The run's pocket statistics (the noise check) and event counters (+ the capped inlet's summary)."""
@@ -387,7 +395,7 @@ class PneumaticChamber:
                 "p_chamber_gauge_pa", "inlet_q_m3s", "inlet_q_capped", "inlet_air_mass_kg", "inlet_air_volume_m3",
                 "inlet_omega_rad_s", "inlet_dt_limit_s", "inlet_capped_steps", "inlet_fallback", "inlet_fallbacks",
                 "inlet_exchange_pa_m3", "inlet_ledger_residual_pa_m3", "inlet_turbulent_steps",
-                "inlet_transition_steps")})
+                "inlet_transition_steps", "inlet_reappearances")})
         return dict(rep, air_volume_m3=last.get("air_volume_m3"), air_cells=last.get("air_cells"),
                     divergence_residual_water_max_1ps=rep["water_divergence_max_1ps"] if divergence else None,
                     divergence_residual_outlet_max_1ps=rep["outlet_divergence_max_1ps"] if divergence else None,
@@ -436,6 +444,13 @@ class PneumaticChamber:
         return host
 
     def load_state_host(self, values):
+        written = "capped" if "inlet_air" in values else "ideal"          # the inlet model and its line are physics:
+        if written != self.inlet_air.kind:                                 # refused before anything is loaded
+            raise ValueError("the checkpoint was written with the %s inlet; this chamber uses the %s inlet"
+                             % (written, self.inlet_air.kind))
+        if written == "capped" and values["inlet_air"].get("line_config") != self.inlet_air.line_config():
+            raise ValueError("the checkpoint's inlet line %s is not this chamber's %s"
+                             % (values["inlet_air"].get("line_config"), self.inlet_air.line_config()))
         for prefix, part in self._parts():
             part.load_state_host({name[len(prefix):]: value for name, value in values.items()
                                   if name.startswith(prefix)})
@@ -449,8 +464,6 @@ class PneumaticChamber:
         self.noise_event_refreshes = values["noise_event_refreshes"]
         self.noise_event_pockets = values["noise_event_pockets"]
         if self.inlet_air.is_capped:
-            if "inlet_air" not in values:
-                raise ValueError("the checkpoint has no capped-inlet state (written with the ideal inlet)")
             self.inlet_air.load_state_host(values["inlet_air"])
             self.inlet_omega_rad_s = values["inlet_omega_rad_s"]
             self.inlet_omega_max_rad_s = values["inlet_omega_max_rad_s"]
