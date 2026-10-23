@@ -33,6 +33,18 @@ off from the inlet seals; until then it is inlet air.  raster_interval N re-rast
 (drain_candidate_events()).
 TRANSFERS: see gas_regions_device (two reads under 1 KB without flips); while the inlet is covered one more 8-byte
 read (the covering area) per accept.  The run totals are in run_summary()["transfers"].
+CAPPED INLET (inlet_model="capped"; the default "ideal" leaves every path above unchanged): the inlet-connected air
+becomes a lumped gas volume behind the line (boundary/inlet_air.InletAirModel: its own gas q = p_abs V; the line's law
+p_line - p_chamber = a Q + b Q|Q| from inlet_line_elements -- the passages between the gauge and the hole, in flow
+order -- and the lid hole's diameter and length (SeriesRestriction; the hole alone by default); the free-flow cap
+|Q| <= Q_cap, an optional line volume).  The driver takes the step's inlet pressure from
+inlet_gauge_pa(t_mid, p_line) -- the line pressure (ideal) or the region's p_chamber (capped) -- and passes it to
+update / apply_inlet_traction / after_project as before; accept() still receives the LINE pressure at t_new: with the
+capped inlet the topology stage seals and reopens pockets at p_chamber (their gas exchange leaves or joins q), then the
+flow step runs at the accepted volume (air_volume_m3, the INLET_GAS cells' free volume, pending candidate regions
+included, + the line volume) with Q = 0 while the inlet is covered.  The region is a gas spring like a pocket: its
+omega = sqrt(p_abs A^2 / (V m)) (A, m: gas_regions_device's opt-in inlet spring sums) joins dt_limit() as
+0.9 x 0.5 / omega.
 
 No `from __future__ import annotations` (Taichi kernel module).
 """
@@ -43,7 +55,9 @@ import taichi as ti
 
 from fastfsi.boundary.gas_pocket_transitions import M_MIN, N_SEAL
 from fastfsi.boundary.gas_pockets import P_ATMOSPHERE_PA
-from fastfsi.boundary.gas_regions_device import DeviceGasRegions
+from fastfsi.boundary.gas_regions_device import STIFFNESS_LIMIT, STIFFNESS_MARGIN, DeviceGasRegions
+from fastfsi.boundary.inlet_air import HARD_STOP_CODES as INLET_AIR_HARD_STOP_CODES
+from fastfsi.boundary.inlet_air import FlowElement, InletAirModel, SeriesRestriction
 from fastfsi.boundary.solid_occupancy import (DEFAULT_BOX_SAMPLES, DEFAULT_HYSTERESIS_STEPS, DEFAULT_STRETCH_FACTOR,
                                         DEFAULT_SUB, SolidOccupancy)
 from fastfsi.boundary.pressure_regions import DEFAULT_PENALTY_FACTOR, PressureRegions
@@ -51,7 +65,7 @@ from fastfsi.boundary.pressure_regions import PROJECT_REQUIREMENTS  # noqa: F401
 from fastfsi.errors import SimulationHardStop
 from fastfsi.point_tags import TAG_CHAMBER_SURFACE
 
-HARD_STOP_CODES = {"pneumatic_chamber_inlet_without_surface", "pneumatic_chamber_floor_material"}
+HARD_STOP_CODES = {"pneumatic_chamber_inlet_without_surface", "pneumatic_chamber_floor_material"} | INLET_AIR_HARD_STOP_CODES
 NOISE_EVENT_LOG_MAX = 200                # the first events kept in full (the counts are complete)
 FOOTPRINT_SAMPLES = 8
 
@@ -91,7 +105,9 @@ class PneumaticChamber:
                  stretch_factor=DEFAULT_STRETCH_FACTOR, box_samples=DEFAULT_BOX_SAMPLES,
                  hysteresis_steps=DEFAULT_HYSTERESIS_STEPS, penalty_factor=DEFAULT_PENALTY_FACTOR,
                  inlet_traction=True, surface_tag=TAG_CHAMBER_SURFACE, max_pockets=4096, flood_batch=16,
-                 staging=65536, seal_steps=N_SEAL, min_cells=M_MIN, raster_interval=1):
+                 staging=65536, seal_steps=N_SEAL, min_cells=M_MIN, raster_interval=1, inlet_model="ideal",
+                 inlet_hole_length_m=None, inlet_hole_coefficients=None, inlet_flow_cap_m3_s=math.inf,
+                 inlet_line_volume_m3=0.0, inlet_line_elements=()):
         faces = tuple(np.asarray(f, dtype=np.float64) for f in axes.faces_m)
         box = chamber_box(faces, axis_xy_m, float(radius_m), float(box_z_lo_m), float(lid_z_m))
         self.fluid = fluid
@@ -105,6 +121,26 @@ class PneumaticChamber:
         if not (math.isfinite(self.inlet_diameter_m) and self.inlet_diameter_m > 0.0):
             raise ValueError("inlet_diameter_m must be finite and positive")
         self.inlet_area_m2 = math.pi * 0.25 * self.inlet_diameter_m ** 2
+        line_elements = tuple(inlet_line_elements)
+        if line_elements and inlet_model != "capped":
+            raise ValueError("inlet_line_elements need the capped inlet")
+        restriction = None                                 # ideal: no line
+        if inlet_model == "capped":                        # the line from the geometry unless given (tests)
+            if inlet_hole_coefficients is not None:
+                if line_elements:
+                    raise ValueError("give inlet_line_elements or inlet_hole_coefficients, not both")
+                restriction = SeriesRestriction(coefficients=inlet_hole_coefficients)
+            elif inlet_hole_length_m is None:
+                raise ValueError("the capped inlet needs inlet_hole_length_m (or inlet_hole_coefficients)")
+            else:                                          # the passages from the gauge, then the lid hole
+                restriction = SeriesRestriction(line_elements + (FlowElement(
+                    "lid hole", "hole", self.inlet_diameter_m, float(inlet_hole_length_m)),))
+        self.inlet_hole_length_m = None if inlet_hole_length_m is None else float(inlet_hole_length_m)
+        self.inlet_air = InletAirModel(inlet_model, restriction=restriction, flow_cap_m3_s=float(inlet_flow_cap_m3_s),
+                                       line_volume_m3=float(inlet_line_volume_m3), ambient_pa=float(ambient_pressure_pa))
+        self.inlet_omega_rad_s = 0.0
+        self.inlet_omega_max_rad_s = 0.0
+        self.inlet_dt_limit_s = math.inf
         self.inlet_traction = bool(inlet_traction)
         self.surface_tag = int(surface_tag)
         self.occupancy = SolidOccupancy(axes, box, points, body_indices, reference_positions_m, spacing_m, sub=sub,
@@ -132,7 +168,8 @@ class PneumaticChamber:
                                         ambient_pressure_pa=ambient_pressure_pa,
                                         pressure_bounds_abs_pa=pressure_bounds_abs_pa, max_pockets=max_pockets,
                                         flood_batch=flood_batch, staging=staging, seal_steps=seal_steps,
-                                        min_cells=min_cells, raster_interval=raster_interval)
+                                        min_cells=min_cells, raster_interval=raster_interval,
+                                        inlet_spring=self.inlet_air.is_capped)
         self.candidate_events_pending = []      # candidate-region events until the driver drains them (not carried)
         self.area = ti.field(ti.f64, shape=self.occupancy.n_body)
         self.area_total = ti.field(ti.f64, shape=())
@@ -201,9 +238,17 @@ class PneumaticChamber:
         return True
 
     # ------------------------------------------------------------------------------------------------ protocol
+    def inlet_gauge_pa(self, t_s, p_line_fn):
+        """The inlet air's gauge pressure for the step solved at t_s: the line pressure p_line_fn(t_s) (ideal) or the
+        capped region's pressure (the state of the last accept)."""
+        p_line = p_line_fn(t_s)
+        return self.inlet_air.pressure_gauge_pa(p_line) if self.inlet_air.is_capped else p_line
+
     def accept(self, t_s, inlet_gauge_pa, dt_taken_s=None):
         """The accepted geometry at t_s: refresh everything for the next step; checks the step just taken against the
-        pocket stiffness bound and the covering area of the last traction.  Returns the diagnostics."""
+        pocket stiffness bound and the covering area of the last traction.  inlet_gauge_pa is the LINE pressure at t_s
+        (with the capped inlet the pockets seal at p_chamber and the flow step uses the line pressure).  Returns the
+        diagnostics."""
         area_reads = 0
         if self.covered and self.inlet_traction and self.traction_steps:
             total = float(self.area_total.to_numpy())
@@ -211,12 +256,20 @@ class PneumaticChamber:
             if total <= 0.0:
                 raise SimulationHardStop("pneumatic_chamber_inlet_without_surface", dict(
                     time_s=float(t_s), inlet_area_m2=self.inlet_area_m2, inlet_centre_xy_m=list(self.inlet_centre_xy_m)))
-        diagnostics = self.regions.refresh(t_s, inlet_gauge_pa)
+        capped = self.inlet_air.is_capped
+        if capped:
+            exchange_before = self.regions.exchange_pa_m3
+            diagnostics = self.regions.refresh(t_s, self.inlet_air.pressure_gauge_pa(inlet_gauge_pa))
+        else:
+            diagnostics = self.regions.refresh(t_s, inlet_gauge_pa)
         floor = self._floor_material()
         if floor:
             raise SimulationHardStop("pneumatic_chamber_floor_material", dict(time_s=float(t_s), cells=floor))
         if dt_taken_s is not None:
             self.regions.check_step(dt_taken_s)
+        if capped:
+            diagnostics = dict(diagnostics, **self._advance_inlet(t_s, inlet_gauge_pa, dt_taken_s, diagnostics,
+                                                                 self.regions.exchange_pa_m3 - exchange_before))
         self.covered = bool(diagnostics["inlet_covered"])
         self.accepts += 1
         for run, step in zip(self.noise_run, diagnostics["noise"]):
@@ -244,12 +297,45 @@ class PneumaticChamber:
         self.candidate_events_pending.extend(dict(e) for e in diagnostics.get("candidate_events_new") or [])
         return dict(self.last)
 
+    def _advance_inlet(self, t_s, p_line_pa, dt_taken_s, diagnostics, exchange_pa_m3):
+        """The capped inlet after a refresh: start (first accept) or the step's exchange and flow at the accepted volume;
+        then the region's gas-spring omega and its dt bound.  Returns the inlet diagnostics."""
+        model = self.inlet_air
+        volume = float(diagnostics["air_volume_m3"])
+        covered = bool(diagnostics["inlet_covered"])
+        if model.q_pa_m3 is None:
+            model.start(p_line_pa, volume)
+        else:
+            if dt_taken_s is None:
+                raise ValueError("the capped inlet needs dt_taken_s at every accept after the first")
+            model.advance(dt_taken_s, p_line_pa, volume, covered, exchange_pa_m3, t_s=float(t_s))
+        area = float(diagnostics.get("inlet_area_m2", 0.0))
+        mass = float(diagnostics.get("inlet_column_mass_kg", 0.0))
+        pressure = model.p_gauge_pa + model.ambient_pa
+        omega = 0.0
+        if model.volume_m3 > 0.0 and mass > 0.0 and area > 0.0 and not model.fallback:
+            omega = math.sqrt(pressure * area * area / (model.volume_m3 * mass))
+        self.inlet_omega_rad_s = omega
+        self.inlet_omega_max_rad_s = max(self.inlet_omega_max_rad_s, omega)
+        self.inlet_dt_limit_s = STIFFNESS_MARGIN * STIFFNESS_LIMIT / omega if omega > 0.0 else math.inf
+        ledger = model.ledger()
+        return dict(p_chamber_gauge_pa=model.p_gauge_pa, inlet_q_m3s=model.q_m3_s, inlet_q_capped=model.capped,
+                    inlet_air_mass_kg=model.mass_kg(), inlet_air_volume_m3=model.volume_m3,
+                    inlet_omega_rad_s=omega, inlet_dt_limit_s=self.inlet_dt_limit_s,
+                    inlet_capped_steps=model.capped_steps, inlet_fallback=model.fallback,
+                    inlet_fallbacks=model.fallbacks, inlet_exchange_pa_m3=float(exchange_pa_m3),
+                    inlet_ledger_residual_pa_m3=ledger["residual_pa_m3"],
+                    inlet_turbulent_steps=model.turbulent_steps, inlet_transition_steps=model.transition_steps)
+
     def run_summary(self):
-        """The run's pocket statistics (the noise check) and event counters."""
+        """The run's pocket statistics (the noise check) and event counters (+ the capped inlet's summary)."""
         noise = [dict(run, rms_dp_pa=(math.sqrt(run["sum_dp2_pa2"] / run["count"]) if run["count"] else None))
                  for run in self.noise_run]
         regions = self.regions
-        return dict(accepts=self.accepts, noise=noise, pocket_footprint_kinetic_energy_max_j=self.ke_max_j,
+        inlet = (dict(inlet_air=dict(self.inlet_air.summary(), omega_max_rad_s=self.inlet_omega_max_rad_s,
+                                     hole_length_m=self.inlet_hole_length_m, hole_diameter_m=self.inlet_diameter_m))
+                 if self.inlet_air.is_capped else {})
+        return dict(inlet, accepts=self.accepts, noise=noise, pocket_footprint_kinetic_energy_max_j=self.ke_max_j,
                     seal_events=regions.seal_events, exchange_pa_m3=regions.exchange_pa_m3,
                     topology_changes=regions.topology_changes, host_stages=regions.host_stages,
                     pocket_set_unchanged=regions.pocket_set_unchanged, host_stage_s=regions.host_stage_s,
@@ -274,6 +360,9 @@ class PneumaticChamber:
         return int(topology["floor_material_cells"]) if topology else 0
 
     def dt_limit(self):
+        """The pocket stiffness bound; with the capped inlet also the inlet region's gas spring (0.9 x 0.5 / omega)."""
+        if self.inlet_air.is_capped:
+            return min(self.regions.dt_limit(), self.inlet_dt_limit_s)
         return self.regions.dt_limit()
 
     def update(self, t_s, p_in_pa):
@@ -293,6 +382,12 @@ class PneumaticChamber:
         pocket diagnostics of the last accept."""
         rep = self.chamber.report()
         last = self.last or {}
+        if self.inlet_air.is_capped:                       # the capped inlet's state (absent with the ideal inlet)
+            rep = dict(rep, **{key: last.get(key) for key in (
+                "p_chamber_gauge_pa", "inlet_q_m3s", "inlet_q_capped", "inlet_air_mass_kg", "inlet_air_volume_m3",
+                "inlet_omega_rad_s", "inlet_dt_limit_s", "inlet_capped_steps", "inlet_fallback", "inlet_fallbacks",
+                "inlet_exchange_pa_m3", "inlet_ledger_residual_pa_m3", "inlet_turbulent_steps",
+                "inlet_transition_steps")})
         return dict(rep, air_volume_m3=last.get("air_volume_m3"), air_cells=last.get("air_cells"),
                     divergence_residual_water_max_1ps=rep["water_divergence_max_1ps"] if divergence else None,
                     divergence_residual_outlet_max_1ps=rep["outlet_divergence_max_1ps"] if divergence else None,
@@ -335,6 +430,9 @@ class PneumaticChamber:
                     noise_run=[dict(run) for run in self.noise_run], ke_max_j=self.ke_max_j,
                     transfer_run=dict(self.transfer_run), noise_events=[dict(e) for e in self.noise_events],
                     noise_event_refreshes=self.noise_event_refreshes, noise_event_pockets=self.noise_event_pockets)
+        if self.inlet_air.is_capped:          # the capped inlet's state (absent with the ideal inlet; JSON: no inf)
+            host.update(inlet_air=self.inlet_air.state_host(), inlet_omega_rad_s=self.inlet_omega_rad_s,
+                        inlet_omega_max_rad_s=self.inlet_omega_max_rad_s)
         return host
 
     def load_state_host(self, values):
@@ -350,3 +448,11 @@ class PneumaticChamber:
         self.noise_events = [dict(e) for e in values["noise_events"]]
         self.noise_event_refreshes = values["noise_event_refreshes"]
         self.noise_event_pockets = values["noise_event_pockets"]
+        if self.inlet_air.is_capped:
+            if "inlet_air" not in values:
+                raise ValueError("the checkpoint has no capped-inlet state (written with the ideal inlet)")
+            self.inlet_air.load_state_host(values["inlet_air"])
+            self.inlet_omega_rad_s = values["inlet_omega_rad_s"]
+            self.inlet_omega_max_rad_s = values["inlet_omega_max_rad_s"]
+            omega = self.inlet_omega_rad_s
+            self.inlet_dt_limit_s = STIFFNESS_MARGIN * STIFFNESS_LIMIT / omega if omega > 0.0 else math.inf

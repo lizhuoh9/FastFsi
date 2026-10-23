@@ -56,6 +56,26 @@ First version of the package layout `src/fastfsi` (replaces the earlier flat lay
   the labels with one min-label sweep triple, instead of iterating sweep batches until nothing changes; a label the
   certificate changes fails the graph closed (`component_labels_not_converged`).  The labels are the same fixed point;
   the slot passes run only when the init kernel counted slot cells.
+- Capped inlet (`PneumaticChamber(inlet_model="capped")`, `fastfsi.boundary.inlet_air`; the default `"ideal"` is
+  unchanged): the inlet-connected air keeps its own gas q = p_abs V (isothermal; the volume is the inlet gas's free
+  volume, pending candidate regions included, plus an optional line volume) and is fed from the measured line pressure
+  through round passages in series (`SeriesRestriction`; `inlet_line_elements` before the lid hole, for the robot the
+  gauge's Y fitting's bore, the hose and a straight connector's bore; the lid hole alone by default):
+  p_line − p_chamber = a Q + b Q|Q|, with each passage's Poiseuille friction a_i = 128 μ L_i / (π D_i⁴) (a hose
+  switches to Blasius above Re 2300) and the joints' dynamic heads from the area ratios (a contraction
+  0.5 (1 − A_small / A_large), an expansion (1 − A_small / A_large)², the measuring point and the chamber as large
+  volumes; the 2 mm × 7 mm lid hole alone has 1.5 heads, 123 Pa at 35 mL/s at p_atm), with the free flow capped at
+  |Q| ≤ Q_cap.  The line's gas is at p_abs, so every loss term scales by p_atm / p_mean with
+  p_mean = p_atm + (p_line + p_chamber) / 2 (its volume flow is the free-air Q × p_atm / p_abs); the narrowest
+  passage's Mach number is logged (`mach_max`; no compressibility model).  After every accepted geometry a
+  backward-Euler step in q solves the law (in closed form while the hose is laminar, by bisection otherwise);
+  pockets seal and reopen at p_chamber and their gas leaves or joins q (a ledger q − q₀ = inflow − exchange); a
+  covered inlet has no flow, and an inlet region without volume falls back to
+  the line pressure (counted and logged).  `inlet_gauge_pa(t, p_line)` gives the step's inlet pressure (the line's,
+  or p_chamber), which the driver passes to `update`, the covered-inlet traction and `after_project`.  The region is
+  a gas spring like a pocket: ω = sqrt(p_abs A² / (V m)) from the opt-in inlet-spring sums of
+  `DeviceGasRegions(inlet_spring=True)` joins `dt_limit()`.  Its state is checkpointed; a non-positive absolute
+  pressure is the hard stop `inlet_air_invalid_pressure`.
 - Checkpoint / restart: `fastfsi.io.checkpoint` (create-only NPZ checkpoints), `fastfsi.io.restart` (checkpoint
   schedule, manifest checks), `fastfsi.io.run_segments` (joins restarted segments).
 - Turek–Hron example: `--checkpoint-every-s`, `--checkpoint-at`, `--restart-from`, `--diagnostic-restart`; argument

@@ -32,6 +32,9 @@ PER REFRESH (an accepted geometry; refresh(t, p_in)):
      and the noise events: pockets >= 5 mm^3 with |dp| > 1 kPa, their number and the largest one)
                                                                                                  [read 2: statistics]
   With no flipped cell, step 2 and every transfer but the two small reads are skipped.
+  INLET SPRING (inlet_spring=True, the capped inlet of pneumatic_chamber; off by default, and then the kernels and the
+  transfers are unchanged): the volumes kernel also sums the INLET_GAS cells' faces against material and the body mass
+  of their footprint columns (as for a pocket), read once more per refresh (2 f64): inlet_area_m2, inlet_column_mass_kg.
 SEALING RULE (gas_pocket_transitions): a candidate region cut off from the inlet air seals only after
 `seal_steps` occupancy updates with at least `min_cells` cells (N_SEAL = 5, M_MIN = 8); until then its cells stay
 INLET_GAS (Dirichlet at p_in) and carry a pending-region number (field cand_id).  The host keeps one record per pending
@@ -121,6 +124,10 @@ S_NOISE = 17                             # NBINS x (max |dp|, sum dp^2, count)
 S_OMEGA_CHECKED = S_NOISE + 3 * NBINS
 S_WORST_CHECKED = S_OMEGA_CHECKED + 1
 STATS_SLOTS = S_WORST_CHECKED + 1
+# the opt-in inlet spring (a separate f64 field, read once per refresh when on): the INLET_GAS faces against material
+# and the body mass of its footprint columns
+I_INLET_AREA, I_INLET_MASS = 0, 1
+INLET_SPRING_SLOTS = 2
 NOISE_EVENT_VOLUME_M3 = 5.0e-9           # 5 mm^3
 NOISE_EVENT_DP_PA = 1.0e3                # 1 kPa
 CANDIDATE_EVENT_LOG_MAX = 200            # the first candidate-region events kept in full (counters complete)
@@ -161,7 +168,7 @@ class DeviceGasRegions(Checkpointable):
     def __init__(self, occupancy, chamber, air_cell, wall, inlet_cells, *, ambient_pressure_pa=P_ATMOSPHERE_PA,
                  pressure_bounds_abs_pa=None, max_pockets=DEFAULT_MAX_POCKETS, flood_batch=DEFAULT_FLOOD_BATCH,
                  staging=DEFAULT_STAGING, volume_bins_m3=DEFAULT_VOLUME_BINS_M3, seal_steps=N_SEAL, min_cells=M_MIN,
-                 raster_interval=1, type_memory=True):
+                 raster_interval=1, type_memory=True, inlet_spring=False):
         shape = tuple(occupancy.shape)
         wall = np.asarray(wall, dtype=bool)
         inlet = np.asarray(inlet_cells, dtype=bool)
@@ -237,6 +244,11 @@ class DeviceGasRegions(Checkpointable):
         self.ctr = ti.field(ti.i32, shape=C_SLOTS)
         self.badbox = ti.field(ti.i32, shape=6)
         self.stats = ti.field(ti.f64, shape=STATS_SLOTS)
+        # INLET SPRING (opt-in, the capped inlet of pneumatic_chamber): the inlet gas's faces against material (area)
+        # and the body mass of its footprint columns, summed like a pocket's A and m; off, the kernels are unchanged
+        self.inlet_spring = bool(inlet_spring)
+        if self.inlet_spring:
+            self.inlet_spring_stats = ti.field(ti.f64, shape=INLET_SPRING_SLOTS)
         self.pockets = 0
         self.initialized = False
         self.refreshes = 0
@@ -467,6 +479,9 @@ class DeviceGasRegions(Checkpointable):
         self.stats[S_AIR_VOLUME] = 0.0
         self.stats[S_AIR_CELLS] = 0.0
         self.stats[S_INLET_AIR] = 0.0
+        if ti.static(self.inlet_spring):
+            self.inlet_spring_stats[I_INLET_AREA] = 0.0
+            self.inlet_spring_stats[I_INLET_MASS] = 0.0
         for i, j, k in self.code:
             c = self.code[i, j, k]
             cover = ti.cast(self.occupancy.coverage_field[i, j, k], ti.f64)
@@ -502,6 +517,26 @@ class DeviceGasRegions(Checkpointable):
                     ti.atomic_add(self.rV[region - 1], free_volume)
                 if self.inlet[i, j, k] != 0:
                     ti.atomic_add(self.stats[S_INLET_AIR], 1.0)
+                if ti.static(self.inlet_spring):        # the inlet gas as a gas spring: A and m as for a pocket
+                    area = ti.cast(0.0, ti.f64)
+                    if i > 0 and self.code[i - 1, j, k] == 0 and self.wall[i - 1, j, k] == 0:
+                        area += self._face_area(i, j, k, 0)
+                    if i < self.shape[0] - 1 and self.code[i + 1, j, k] == 0 and self.wall[i + 1, j, k] == 0:
+                        area += self._face_area(i, j, k, 0)
+                    if j > 0 and self.code[i, j - 1, k] == 0 and self.wall[i, j - 1, k] == 0:
+                        area += self._face_area(i, j, k, 1)
+                    if j < self.shape[1] - 1 and self.code[i, j + 1, k] == 0 and self.wall[i, j + 1, k] == 0:
+                        area += self._face_area(i, j, k, 1)
+                    if k > 0 and self.code[i, j, k - 1] == 0 and self.wall[i, j, k - 1] == 0:
+                        area += self._face_area(i, j, k, 2)
+                    if k < self.shape[2] - 1 and self.code[i, j, k + 1] == 0 and self.wall[i, j, k + 1] == 0:
+                        area += self._face_area(i, j, k, 2)
+                    ti.atomic_add(self.inlet_spring_stats[I_INLET_AREA], area)
+                    top = k == self.shape[2] - 1
+                    if not top:
+                        top = self.code[i, j, k + 1] != c
+                    if top and ti.static(self.occupancy.with_columns):
+                        ti.atomic_add(self.inlet_spring_stats[I_INLET_MASS], self.occupancy.column_mass_field[i, j])
             elif c == 0 and self.wall[i, j, k] == 0:
                 around = ti.Vector([0, 0, 0, 0, 0, 0])
                 if i > 0:
@@ -911,6 +946,10 @@ class DeviceGasRegions(Checkpointable):
             candidate_counters=dict(self.candidate_counters),
             candidate_events_new=[dict(e) for e in self.candidate_events_new],
             raster_skips=self.raster_skips, rasterised=not skip)
+        if self.inlet_spring:                             # opt-in: one more read (2 f64), counted in the transfers
+            spring = self._read(self.inlet_spring_stats)
+            self.last.update(inlet_area_m2=float(spring[I_INLET_AREA]), inlet_column_mass_kg=float(spring[I_INLET_MASS]),
+                             transfers=dict(self.transfers))
         return dict(self.last)
 
     def dt_limit(self):
