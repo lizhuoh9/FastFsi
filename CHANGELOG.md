@@ -25,6 +25,12 @@ First version of the package layout `src/fastfsi` (replaces the earlier flat lay
   (both F-update kernels; the midpoint predict runs the Euler one), so their F stays I and their stress 0; F is set to I
   at construction and after a checkpoint load (`reset_held_deformation()`, the largest |F − I| removed kept in
   `held_f_reset`).
+- Isochoric F update (`ImmersedBoundaryCoupler(f_update="isochoric")`, opt-in; the default `"full"` is unchanged): F
+  integrates the interpolated velocity gradient, whose trace is not zero although the fluid is incompressible, so
+  det F drifted from the point cloud's own volume and the bulk modulus turned that drift into a spurious mean stress.
+  Isochoric updates F with the deviatoric gradient G − tr(G)/3 I in both F updates and renormalises it by
+  det(F)^(−1/3), so det F = 1 holds to round-off (held points follow `held_f`); `f_update_report()` returns the
+  largest |det F − 1| removed since the last read.
 - Boundary models: pressure chambers and pressure regions, gas regions and sealed gas pockets (isothermal gas law),
   solid occupancy, and a pneumatic chamber (a pressure inlet through a hole that a solid may cover).
 - Shifted-pressure chambers carry their projection contract (`PROJECT_REQUIREMENTS`: z-min outlet, outlet backflow

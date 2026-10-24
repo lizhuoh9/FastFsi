@@ -34,6 +34,13 @@ stress.  held_f="frozen" skips the F update of tethered points: their F stays I 
 checkpoint load, the largest |F - I| removed kept in held_f_reset), so their stress is 0 and the clamp alone supplies
 the edge's reaction.  The default held_f="evolve" updates every point, as before.
 
+Isochoric F update (3-D, Root 2026-10-24, the membrane gates' drift): F integrates the interpolated gradient, whose
+trace is not zero although the fluid is incompressible, so det F drifts from the point cloud's own volume and kappa
+turns the drift into a spurious mean stress.  f_update="isochoric" updates F with the deviatoric gradient
+G - tr(G)/3 I in both F updates and renormalises it by det(F)^(-1/3), so det F = 1 holds to round-off; the largest
+|det F - 1| removed since the last f_update_report() is kept.  It acts on every point whose F is updated (held points
+follow held_f).  The default f_update="full" is the update as before.
+
 Point tags (fastfsi.point_tags): the min D of the TAG_CHAMBER_SURFACE points and of the free TAG_CONTACT_RIM points are
 reported separately.
 
@@ -63,6 +70,7 @@ from fastfsi.solid.materials import evaluate_neo_hookean_kirchhoff, evaluate_neo
 
 CLAMP_MODES = ("penalty", "direct")
 HELD_F_MODES = ("evolve", "frozen")
+F_UPDATE_MODES = ("full", "isochoric")
 WITNESS_SLOTS = 16
 SUPPORT_REACH = 3         # cells: covers both node families of the 4-node support around the host cell
 HARD_STOP_CODES = set(REGISTERED_HARD_STOP_CODES)
@@ -85,12 +93,19 @@ class ImmersedBoundaryCoupler(ExcessMassCouplerMixin, Checkpointable):
 
     def __init__(self, *, fluid, weights, mask, points, tether_stiffness_pa_per_m, interior_shortcut=True,
                  unroll_static=False, clamp="penalty", clamp_density_kgm3=None, fluid_density_kgm3=None,
-                 excess_mass_mode="auto", excess_mass_omega_rad_s=None, cfl_elastic=.3, held_f="evolve"):
+                 excess_mass_mode="auto", excess_mass_omega_rad_s=None, cfl_elastic=.3, held_f="evolve",
+                 f_update="full"):
         if held_f not in HELD_F_MODES:
             raise ValueError("held_f must be one of %s, got %r" % (HELD_F_MODES, held_f))
+        if f_update not in F_UPDATE_MODES:
+            raise ValueError("f_update must be one of %s, got %r" % (F_UPDATE_MODES, f_update))
         self.held_f = held_f
         self.freeze_held_f = held_f == "frozen"
         self.held_f_reset = None
+        self.f_update = f_update
+        self.isochoric_f = f_update == "isochoric"
+        if self.isochoric_f:
+            self._f_removed = ti.field(ti.f32, shape=())                   # largest |det F - 1| removed
         self.fluid = fluid
         self.weights = weights
         self.mask = mask
@@ -313,6 +328,20 @@ class ImmersedBoundaryCoupler(ExcessMassCouplerMixin, Checkpointable):
                 dg = uval * g
         return dv, dg
 
+    @ti.func
+    def _isochoric(self, F):
+        """F / det(F)^(1/3); records |det F - 1| (f_update="isochoric", module docstring)."""
+        J = F.determinant()
+        ti.atomic_max(self._f_removed[None], ti.abs(J - 1.0))
+        scale = 1.0
+        if J > 0.0:
+            scale = ti.pow(J, -1.0 / 3.0)
+        return F * scale
+
+    @ti.func
+    def _deviatoric(self, G):
+        return G - (G.trace() / 3.0) * ti.Matrix.identity(ti.f32, 3)
+
     @ti.kernel
     def _interpolate_update_kernel(self, velocity: ti.template(), dt: ti.f32):
         for p in range(self.n):
@@ -322,7 +351,15 @@ class ImmersedBoundaryCoupler(ExcessMassCouplerMixin, Checkpointable):
             self.points.grad_v[p] = G
             self.points.u[p] += dt * v
             self.points.x[p] = self.points.X0[p] + self.points.u[p]
-            if ti.static(self.freeze_held_f):                 # a held point's F stays I (module docstring)
+            if ti.static(self.isochoric_f):
+                if ti.static(self.freeze_held_f):
+                    if self.points.tether[p] == 0:
+                        self.points.F[p] = self._isochoric(
+                            (ti.Matrix.identity(ti.f32, 3) + dt * self._deviatoric(G)) @ self.points.F[p])
+                else:
+                    self.points.F[p] = self._isochoric(
+                        (ti.Matrix.identity(ti.f32, 3) + dt * self._deviatoric(G)) @ self.points.F[p])
+            elif ti.static(self.freeze_held_f):               # a held point's F stays I (module docstring)
                 if self.points.tether[p] == 0:
                     self.points.F[p] = (ti.Matrix.identity(ti.f32, 3) + dt * G) @ self.points.F[p]
             else:
@@ -339,11 +376,29 @@ class ImmersedBoundaryCoupler(ExcessMassCouplerMixin, Checkpointable):
             self.points.grad_v[p] = G
             self.points.u[p] = self.points.u_n[p] + dt * v
             self.points.x[p] = self.points.X0[p] + self.points.u[p]
-            if ti.static(self.freeze_held_f):
+            if ti.static(self.isochoric_f):
+                if ti.static(self.freeze_held_f):
+                    if self.points.tether[p] == 0:
+                        self.points.F[p] = self._isochoric(
+                            self.points.F_n[p] + dt * (self._deviatoric(G) @ self.points.F[p]))
+                else:
+                    self.points.F[p] = self._isochoric(
+                        self.points.F_n[p] + dt * (self._deviatoric(G) @ self.points.F[p]))
+            elif ti.static(self.freeze_held_f):
                 if self.points.tether[p] == 0:
                     self.points.F[p] = self.points.F_n[p] + dt * (G @ self.points.F[p])
             else:
                 self.points.F[p] = self.points.F_n[p] + dt * (G @ self.points.F[p])
+
+    def f_update_report(self, reset=True):
+        """The F update mode and, for f_update="isochoric", the largest |det F - 1| the renormalisation removed since
+        the last report (one host read; reset=True starts the next interval)."""
+        removed = None
+        if self.isochoric_f:
+            removed = float(self._f_removed[None])
+            if reset:
+                self._f_removed[None] = 0.0
+        return dict(f_update=self.f_update, max_abs_det_f_minus_1_removed=removed)
 
     @ti.kernel
     def _reset_held_F_kernel(self):
