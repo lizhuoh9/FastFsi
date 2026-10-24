@@ -28,6 +28,12 @@ Clamp: clamp="penalty" pulls tethered points back to their anchors with stiffnes
 clamp="direct" makes them a rigid clamp by direct forcing (coupling.direct_forcing.DirectForcingClamp), applied at the
 end of every spread.
 
+Held deformation (3-D, Root 2026-10-24): the direct clamp holds a tethered point's interpolated VELOCITY near 0, but F
+integrates the interpolated gradient, so a held region that does not move still accumulates strain and spreads its
+stress.  held_f="frozen" skips the F update of tethered points: their F stays I (set at construction and again after a
+checkpoint load, the largest |F - I| removed kept in held_f_reset), so their stress is 0 and the clamp alone supplies
+the edge's reaction.  The default held_f="evolve" updates every point, as before.
+
 Point tags (fastfsi.point_tags): the min D of the TAG_CHAMBER_SURFACE points and of the free TAG_CONTACT_RIM points are
 reported separately.
 
@@ -56,6 +62,7 @@ from fastfsi.point_tags import TAG_CHAMBER_SURFACE, TAG_CONTACT_RIM
 from fastfsi.solid.materials import evaluate_neo_hookean_kirchhoff, evaluate_neo_hookean_kirchhoff_planar
 
 CLAMP_MODES = ("penalty", "direct")
+HELD_F_MODES = ("evolve", "frozen")
 WITNESS_SLOTS = 16
 SUPPORT_REACH = 3         # cells: covers both node families of the 4-node support around the host cell
 HARD_STOP_CODES = set(REGISTERED_HARD_STOP_CODES)
@@ -78,7 +85,12 @@ class ImmersedBoundaryCoupler(ExcessMassCouplerMixin, Checkpointable):
 
     def __init__(self, *, fluid, weights, mask, points, tether_stiffness_pa_per_m, interior_shortcut=True,
                  unroll_static=False, clamp="penalty", clamp_density_kgm3=None, fluid_density_kgm3=None,
-                 excess_mass_mode="auto", excess_mass_omega_rad_s=None, cfl_elastic=.3):
+                 excess_mass_mode="auto", excess_mass_omega_rad_s=None, cfl_elastic=.3, held_f="evolve"):
+        if held_f not in HELD_F_MODES:
+            raise ValueError("held_f must be one of %s, got %r" % (HELD_F_MODES, held_f))
+        self.held_f = held_f
+        self.freeze_held_f = held_f == "frozen"
+        self.held_f_reset = None
         self.fluid = fluid
         self.weights = weights
         self.mask = mask
@@ -113,6 +125,9 @@ class ImmersedBoundaryCoupler(ExcessMassCouplerMixin, Checkpointable):
                                omega_rad_s=excess_mass_omega_rad_s)
         if self.excess_mass is not None and int(self.count_D0[None]):
             self.one_sided_report(reset=False)          # the partners' initial gather met an empty support
+        if self.freeze_held_f:
+            self._held_f_removed = ti.field(ti.f32, shape=2)                # largest |F - I|, held points
+            self.reset_held_deformation()
 
     # ------------------------------------------------------------------------------------------------ helpers
     @ti.func
@@ -307,7 +322,11 @@ class ImmersedBoundaryCoupler(ExcessMassCouplerMixin, Checkpointable):
             self.points.grad_v[p] = G
             self.points.u[p] += dt * v
             self.points.x[p] = self.points.X0[p] + self.points.u[p]
-            self.points.F[p] = (ti.Matrix.identity(ti.f32, 3) + dt * G) @ self.points.F[p]
+            if ti.static(self.freeze_held_f):                 # a held point's F stays I (module docstring)
+                if self.points.tether[p] == 0:
+                    self.points.F[p] = (ti.Matrix.identity(ti.f32, 3) + dt * G) @ self.points.F[p]
+            else:
+                self.points.F[p] = (ti.Matrix.identity(ti.f32, 3) + dt * G) @ self.points.F[p]
 
     @ti.kernel
     def _midpoint_correct_kernel(self, velocity_old: ti.template(), velocity_new: ti.template(), dt: ti.f32):
@@ -320,7 +339,21 @@ class ImmersedBoundaryCoupler(ExcessMassCouplerMixin, Checkpointable):
             self.points.grad_v[p] = G
             self.points.u[p] = self.points.u_n[p] + dt * v
             self.points.x[p] = self.points.X0[p] + self.points.u[p]
-            self.points.F[p] = self.points.F_n[p] + dt * (G @ self.points.F[p])
+            if ti.static(self.freeze_held_f):
+                if self.points.tether[p] == 0:
+                    self.points.F[p] = self.points.F_n[p] + dt * (G @ self.points.F[p])
+            else:
+                self.points.F[p] = self.points.F_n[p] + dt * (G @ self.points.F[p])
+
+    @ti.kernel
+    def _reset_held_F_kernel(self):
+        self._held_f_removed[0] = 0.0
+        self._held_f_removed[1] = 0.0
+        for p in range(self.n):
+            if self.points.tether[p] != 0:
+                ti.atomic_max(self._held_f_removed[0], (self.points.F[p] - ti.Matrix.identity(ti.f32, 3)).norm())
+                ti.atomic_add(self._held_f_removed[1], 1.0)
+                self.points.F[p] = ti.Matrix.identity(ti.f32, 3)
 
     @ti.kernel
     def _min_D_kernel(self):
@@ -462,6 +495,18 @@ class ImmersedBoundaryCoupler(ExcessMassCouplerMixin, Checkpointable):
 
     def _after_load_state(self):
         self.invalidate_overlap_bound()               # a restart may also have loaded new point positions
+        if self.freeze_held_f:                        # the points component loads before the coupler (its own F)
+            self.reset_held_deformation()
+
+    def reset_held_deformation(self):
+        """held_f="frozen" only: every held point's F to I.  Returns, and keeps as held_f_reset, the largest
+        |F - I| (Frobenius) removed and the number of held points."""
+        if not self.freeze_held_f:
+            raise ValueError("reset_held_deformation needs held_f='frozen'")
+        self._reset_held_F_kernel()
+        removed = self._held_f_removed.to_numpy()
+        self.held_f_reset = dict(max_abs_f_minus_i=float(removed[0]), held_points=int(removed[1]))
+        return self.held_f_reset
 
     def clamp_state(self):
         """Interpolated velocities and direct-forcing forces of the clamped points at the last spread (None for the

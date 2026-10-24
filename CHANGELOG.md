@@ -10,6 +10,12 @@ First version of the package layout `src/fastfsi` (replaces the earlier flat lay
   the exact-residual confirmation, the component compatibility measures and the outlet-reachability flood read one
   small device packet per poll instead of host scalar arithmetic.
 - Excess mass for solids denser than the fluid (`fastfsi.coupling.excess_mass`, penalty-spring partner points).
+- Held deformation (`ImmersedBoundaryCoupler(held_f="frozen")`, opt-in; the default `"evolve"` is unchanged): the
+  direct clamp holds a tethered point's interpolated velocity near 0 while F integrated the interpolated gradient, so a
+  held region that does not move carried strain and spread its stress.  Frozen skips the F update of tethered points
+  (both F-update kernels; the midpoint predict runs the Euler one), so their F stays I and their stress 0; F is set to I
+  at construction and after a checkpoint load (`reset_held_deformation()`, the largest |F − I| removed kept in
+  `held_f_reset`).
 - Boundary models: pressure chambers and pressure regions, gas regions and sealed gas pockets (isothermal gas law),
   solid occupancy, and a pneumatic chamber (a pressure inlet through a hole that a solid may cover).
 - Shifted-pressure chambers carry their projection contract (`PROJECT_REQUIREMENTS`: z-min outlet, outlet backflow
