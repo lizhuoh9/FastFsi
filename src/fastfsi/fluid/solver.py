@@ -2176,6 +2176,26 @@ class IncompressibleFluidSolver(Checkpointable, MomentumAdvection, ObstacleMask,
             )
         return maximum
 
+    def resolved_no_slip_domain_walls(
+        self,
+        no_slip_domain_walls: tuple[bool, bool, bool, bool, bool, bool] | None = None,
+    ) -> tuple[bool, bool, bool, bool, bool, bool]:
+        """The six domain-wall flags (xmin, xmax, ymin, ymax, zmin, zmax) predict() applies for this argument: True
+        is a no-slip wall, False a free-slip one; None gives the solver's own default (laminar: all free-slip)."""
+        if no_slip_domain_walls is None:
+            return (
+                self._sst_no_slip_domain_walls
+                if self.turbulence_model == "sst_2003"
+                else (False, False, False, False, False, False)
+            )
+        wall_flags = tuple(bool(flag) for flag in no_slip_domain_walls)
+        if len(wall_flags) != 6:
+            raise ValueError(
+                "no_slip_domain_walls must contain six booleans: "
+                "(xmin, xmax, ymin, ymax, zmin, zmax)"
+            )
+        return wall_flags
+
     def predict(
         self,
         dt_s: float | None = None,
@@ -2248,19 +2268,7 @@ class IncompressibleFluidSolver(Checkpointable, MomentumAdvection, ObstacleMask,
                 "kinematic_viscosity_m2_s is too large for explicit predictor "
                 f"diffusion stability; diffusion_cfl={diffusion_cfl:g}"
             )
-        if no_slip_domain_walls is None:
-            wall_flags = (
-                self._sst_no_slip_domain_walls
-                if self.turbulence_model == "sst_2003"
-                else (False, False, False, False, False, False)
-            )
-        else:
-            wall_flags = tuple(bool(flag) for flag in no_slip_domain_walls)
-            if len(wall_flags) != 6:
-                raise ValueError(
-                    "no_slip_domain_walls must contain six booleans: "
-                    "(xmin, xmax, ymin, ymax, zmin, zmax)"
-                )
+        wall_flags = self.resolved_no_slip_domain_walls(no_slip_domain_walls)
         wall_flag_codes = tuple(1 if flag else 0 for flag in wall_flags)
         velocity_inlet_zmax_mode = self._resolve_physical_face_topology(
             pressure_outlet_zmin=pressure_outlet_zmin,

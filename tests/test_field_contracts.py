@@ -3,6 +3,7 @@
     parameters, so a rename can never turn the installation into a silent no-op;
   - the fluid solver's checkpoint fields and host attributes exist on a freshly built solver and its host state
     survives the type-exact encoding;
+  - the solver resolves its domain-wall flags as predict() applies them (WholeBodyForce reads them by that name);
   - the checkpoint fields of the 3-D and planar material points exist, and a planar point set is restored bit for bit."""
 import inspect
 
@@ -55,6 +56,14 @@ def test_fluid_checkpoint_names_exist_on_a_fresh_solver(fluid):
     host = fluid.state_host()
     restored = decode_host(encode_host(host))
     assert list(restored) == list(host) and all(same_host_value(host[k], restored[k]) for k in host)
+
+
+def test_the_domain_wall_flags_resolve_as_predict_applies_them(fluid):
+    assert fluid.resolved_no_slip_domain_walls() == (False,) * 6           # laminar: free-slip on all six walls
+    flags = (True, False, True, False, False, True)
+    assert fluid.resolved_no_slip_domain_walls(flags) == flags
+    with pytest.raises(ValueError):
+        fluid.resolved_no_slip_domain_walls((True,) * 5)
 
 
 def material():

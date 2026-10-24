@@ -14,6 +14,11 @@ First version of the package layout `src/fastfsi` (replaces the earlier flat lay
   it holds exert on its mount (a load cell's reading), by control volumes (boxes of cells; a face on the domain's top
   wall over the body's footprint is the body itself) and by the direct sum (obstacle faces and that lid, minus the
   direct clamp's and the caller's point forces), as impulse-exact interval means with one host read per report.
+  A domain wall's shear follows the solver's own wall flags (`no_slip_walls`, resolved by
+  `IncompressibleFluidSolver.resolved_no_slip_domain_walls()`, which `predict()` now uses too): a free-slip wall, the
+  laminar default on all six, carries none, in a box face and on the lid alike; a no-slip wall carries
+  mu u_t / (w/2).  Obstacle faces keep that no-slip estimate: the laminar diffusion treats every fluid-obstacle face
+  as no-slip with the wall on the face.
 - Held deformation (`ImmersedBoundaryCoupler(held_f="frozen")`, opt-in; the default `"evolve"` is unchanged): the
   direct clamp holds a tethered point's interpolated velocity near 0 while F integrated the interpolated gradient, so a
   held region that does not move carried strain and spread its stress.  Frozen skips the F update of tethered points

@@ -6,7 +6,9 @@ a linear pressure gives the obstacle the discrete Archimedes force -G (L + h) L^
 a cup touching the top wall with pressurised gas inside is force-free only with the lid (the top wall over its
 footprint) counted as the body (B), and the box with its top face on that wall reads 0 with no cut face (A);
 a box through the body counts cut faces;
-the clamp's point forces and the caller's point forces enter B with their interval means."""
+the clamp's point forces and the caller's point forces enter B with their interval means;
+a free-slip domain wall carries no shear and a no-slip one the half-cell estimate mu u_t / (w/2), following the
+solver's own wall flags (A), and the lid's shear follows the top wall's flag (B)."""
 from types import SimpleNamespace
 
 import numpy as np
@@ -157,3 +159,43 @@ def test_the_clamp_and_the_point_forces_enter_with_interval_means():
     assert r["b"]["clamp"] == pytest.approx([1.5, 3.0, 1.0])
     assert r["points"]["contact"] == pytest.approx([1.0, 0.0, -4.0])
     assert r["points"]["contact_inlet"] == pytest.approx([1.0, 0.0, -4.0])
+
+
+def wall_shear(no_slip_walls=None, resolver=None):
+    axes, fluid, _ = rig()
+    v = np.zeros((N, N, N, 3), np.float32)
+    v[..., 2] = 0.4                                               # u_z: tangential to the x walls
+    fluid.velocity.from_numpy(v)
+    if resolver is not None:
+        fluid.resolved_no_slip_domain_walls = resolver
+    m = WholeBodyForce(fluid, axes, [dict(i=(0, 5), j=(2, 7), k=(2, 7), name="w")], no_slip_walls=no_slip_walls)
+    m.begin(0.0)
+    m.accumulate(1.0e-3, m.pressure_field(0.0))
+    return m.no_slip_walls, m.report(1.0e-3)["boxes"]["w"]["parts_n"]["wall_shear"]
+
+
+def test_a_free_slip_wall_carries_no_shear_and_a_no_slip_wall_the_half_cell_estimate():
+    expected = MU * 0.4 / (0.5 * H) * (5 * H) ** 2                # the x-min wall under the box, 5 x 5 cells
+    flags, shear = wall_shear()                                   # no solver flags: free-slip, the laminar default
+    assert flags == (False,) * 6 and np.allclose(shear, 0.0, atol=0.0)
+    flags, shear = wall_shear(no_slip_walls=(True,) * 6)
+    assert shear[2] == pytest.approx(expected, rel=1e-6) and np.allclose(shear[:2], 0.0, atol=0.0)
+    flags, shear = wall_shear(resolver=lambda walls=None: (True,) * 6 if walls is None else tuple(walls))
+    assert flags == (True,) * 6 and shear[2] == pytest.approx(expected, rel=1e-6)   # the solver's own default
+
+
+def test_b_the_lid_shear_follows_the_top_wall_flag():
+    axes, fluid, _ = rig()
+    v = np.zeros((N, N, N, 3), np.float32)
+    v[:, :, N - 1, 0] = 0.3                                       # u_x in the top layer, under the lid
+    fluid.velocity.from_numpy(v)
+    footprint = np.zeros((N, N), bool)
+    footprint[3:7, 3:7] = True
+    shears = []
+    for walls in ((False,) * 6, (False,) * 5 + (True,)):
+        m = WholeBodyForce(fluid, axes, [box(2, 7)], top_footprint=footprint, no_slip_walls=walls)
+        m.begin(0.0)
+        m.accumulate(1.0e-3, m.pressure_field(0.0))
+        shears.append(m.report(1.0e-3)["b"]["lid_shear"])
+    assert np.allclose(shears[0], 0.0, atol=0.0)                  # a free-slip top wall: no shear on the lid
+    assert shears[1][0] == pytest.approx(MU * 0.3 / (0.5 * H) * (4 * H) ** 2, rel=1e-6)

@@ -3,16 +3,20 @@ body reads), measured read-only two ways (Root 2026-10-24, the USER's whole-robo
 
 A. CONTROL VOLUME.  Boxes of whole cells around the body (cell index ranges; a box face may lie on a domain wall).
    Newton for the box's contents, the mount being the only other force on them:
-       F = -[ dP/dt + sum_open faces (rho u (u.n) + p n - tau.n) A + sum_wall faces (p n + mu u_t / (w/2)) A ].
+       F = -[ dP/dt + sum_open faces (rho u (u.n) + p n - tau.n) A + sum_wall faces (p n + mu u_t / (w/2)) A ],
+   the wall shear only on a no-slip wall.  The walls are the solver's own (no_slip_walls: the flags given to
+   predict(), resolved by the solver; laminar default: free-slip on all six, which carries no shear).
    P is rho times the water's cell-centred momentum inside the box plus the excess-mass partners' momentum (every
    partner must lie inside every box).  A box face on the domain's top wall over the body's footprint (top_footprint)
-   is the body itself and carries no term; elsewhere a face on a domain wall carries the wall's pressure and its
-   no-slip shear on the box's water, and no flux.  Open faces: p and the advected components averaged to the face,
+   is the body itself and carries no term; elsewhere a face on a domain wall carries the wall's pressure, its shear on
+   the box's water if the wall is no-slip, and no flux.  Open faces: p and the advected components averaged to the face,
    u.n the MAC face velocity, tau = mu (grad u + grad u^T) from central differences of cell-centred velocities.  A face
    whose two cells are not both water (the box cuts the body or the air) is counted (cut_faces) and skipped: a valid box
    has none.
 B. DIRECT SUM.  The pressure (water or air) and the no-slip shear (water) on every face between a non-obstacle cell and
-   an obstacle cell, and on the domain's top-wall faces over top_footprint (a lid that is the domain wall), minus the
+   an obstacle cell (the solver's laminar diffusion treats every such face as no-slip, the wall on the face), and on
+   the domain's top-wall faces over top_footprint (a lid that is the domain wall: its shear only if that wall is
+   no-slip), minus the
    forces the held solids receive from the body: the direct clamp's point forces, and the point forces the caller adds
    (add_point_forces: e.g. the contact, a covered inlet's traction; one slot each).
 Intervals are impulse-exact: every step accumulate(dt) adds F dt of the surface, traction and clamp terms on the device
@@ -39,11 +43,21 @@ class WholeBodyForce:
     excess-mass partners (None: none); point_slots: the names of the add_point_forces slots."""
 
     def __init__(self, fluid, axes, boxes, *, top_footprint=None, air_cell=None, clamp=None, excess_mass=None,
-                 point_forces=None, point_slots=()):
+                 point_forces=None, point_slots=(), no_slip_walls=None):
         self.fluid = fluid
         self.n = tuple(int(v) for v in axes.n)
         nx, ny, nz = self.n
         self.rho, self.mu = float(fluid.rho), float(fluid.mu)
+        resolve = getattr(fluid, "resolved_no_slip_domain_walls", None)
+        if resolve is not None:                               # the solver's own flags for what predict() is given
+            self.no_slip_walls = tuple(bool(v) for v in resolve(no_slip_walls))
+        else:
+            self.no_slip_walls = (tuple(bool(v) for v in no_slip_walls) if no_slip_walls is not None
+                                  else (False,) * 6)
+        if len(self.no_slip_walls) != 6:
+            raise ValueError("no_slip_walls: six flags (xmin, xmax, ymin, ymax, zmin, zmax)")
+        self.wall_no_slip = ti.field(ti.i32, shape=6)
+        self.wall_no_slip.from_numpy(np.array(self.no_slip_walls, np.int32))
         self.boxes = []
         for b in boxes:
             r = tuple(tuple(int(v) for v in b[a]) for a in ("i", "j", "k"))
@@ -145,9 +159,11 @@ class WholeBodyForce:
             if not body:
                 if self._water(i, j, k):
                     p = ti.cast(pressure[i, j, k], ti.f64)
-                    u = self._uc(i, j, k)
-                    u[a] = 0.0
-                    shear = ti.cast(self.mu, ti.f64) * u / (0.5 * self._width(a, i, j, k))
+                    shear = ti.Vector([0.0, 0.0, 0.0], ti.f64)
+                    if self.wall_no_slip[2 * a + (1 if side > 0 else 0)] != 0:     # a free-slip wall carries none
+                        u = self._uc(i, j, k)
+                        u[a] = 0.0
+                        shear = ti.cast(self.mu, ti.f64) * u / (0.5 * self._width(a, i, j, k))
                     for m in ti.static(range(3)):
                         ti.atomic_add(self.acc_a[box, A_WALL_P, m], p * e[m] * area * dt)
                         ti.atomic_add(self.acc_a[box, A_WALL_SHEAR, m], shear[m] * area * dt)
@@ -220,7 +236,7 @@ class WholeBodyForce:
                             pslot = B_LID_P if lid else B_OBSTACLE_P
                             sslot = B_LID_SHEAR if lid else B_OBSTACLE_SHEAR
                             ti.atomic_add(self.acc_b[pslot, a], p * s * area * dt)
-                            if not gas:                              # no-slip shear of the water on the face
+                            if not gas and (not lid or self.wall_no_slip[5] != 0):   # the water's no-slip shear
                                 for m in ti.static(range(3)):
                                     if ti.static(m != a):
                                         ti.atomic_add(self.acc_b[sslot, m],
