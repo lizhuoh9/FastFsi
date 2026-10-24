@@ -42,7 +42,10 @@ LEDGER: inflow = sum p_atm Q dt, exchange = sum of the pocket exchanges and reap
 q - q_0 = inflow - exchange + reappear to round-off.
 GUARD: a non-finite or non-positive absolute pressure of the capped region is the hard stop inlet_air_invalid_pressure.
 CHECKPOINT: the state carries the line's parameters (line_config: a, b, Q_cap, V_line, the elements); a model with
-another line refuses it.
+another line refuses it.  One opt-in exception (the USER 2026-10-24 via Root, a suction sensitivity restarted from a
+run's checkpoint with another free-flow cap): with allow_flow_cap_change_on_load = True the flow cap ALONE may differ
+(check_line_config); the model keeps ITS cap, Q_cap is no state, and the change is recorded in flow_cap_change.  Every
+other difference is refused as before; the default (False) is unchanged.
 """
 import math
 from dataclasses import dataclass
@@ -226,6 +229,17 @@ class SeriesRestriction:
                                "expansion (1 - A_small / A_large)^2; the measuring point and the chamber are large")
 
 
+def check_line_config(saved, line, allow_flow_cap_change=False, holder="model"):
+    """A checkpoint's inlet line (saved) against this one (line): None when equal; with allow_flow_cap_change, the pair
+    (saved cap, this cap) in m^3/s (None: no cap) when the flow cap alone differs; else ValueError."""
+    if saved == line:
+        return None
+    if (allow_flow_cap_change and isinstance(saved, dict) and set(saved) == set(line)
+            and all(saved[k] == line[k] for k in line if k != "flow_cap_m3_s")):
+        return saved["flow_cap_m3_s"], line["flow_cap_m3_s"]
+    raise ValueError("the checkpoint's inlet line %s is not this %s's %s" % (saved, holder, line))
+
+
 class InletAirModel:
     """The inlet air behind the line (module docstring).  ideal: a pass-through (pressure_gauge_pa() returns the line
     pressure; start() and advance() keep no state).  capped: a few host floats per accept.  hole_a / hole_b are the
@@ -285,6 +299,8 @@ class InletAirModel:
         self.q_capped_max_m3_s = 0.0
         self.p_min_gauge_pa = None
         self.p_max_gauge_pa = None
+        self.allow_flow_cap_change_on_load = False   # opt-in: a checkpoint of another flow cap (module docstring)
+        self.flow_cap_change = None                  # set by such a load: the checkpoint's and this model's cap
 
     @property
     def is_capped(self):
@@ -427,11 +443,12 @@ class InletAirModel:
         return values
 
     def load_state_host(self, values):
-        """The state of a checkpoint written with the same line (else ValueError: a run cannot change its line)."""
-        if values.get("line_config") != self.line_config():
-            raise ValueError("the checkpoint's inlet line %s is not this model's %s"
-                             % (values.get("line_config"), self.line_config()))
+        """The state of a checkpoint written with the same line (else ValueError: a run cannot change its line; the
+        one exception, the flow cap with allow_flow_cap_change_on_load, keeps this model's cap and is recorded in
+        flow_cap_change)."""
+        change = check_line_config(values.get("line_config"), self.line_config(), self.allow_flow_cap_change_on_load)
         for name in self.HOST_FIELDS:
             setattr(self, name, values[name])
         self.fallback_events = [dict(e) for e in values["fallback_events"]]
         self.reappear_events = [dict(e) for e in values["reappear_events"]]
+        self.flow_cap_change = None if change is None else dict(checkpoint_m3_s=change[0], model_m3_s=change[1])

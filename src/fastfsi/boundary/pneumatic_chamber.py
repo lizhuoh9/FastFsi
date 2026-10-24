@@ -58,7 +58,7 @@ from fastfsi.boundary.gas_pocket_transitions import M_MIN, N_SEAL
 from fastfsi.boundary.gas_pockets import P_ATMOSPHERE_PA
 from fastfsi.boundary.gas_regions_device import STIFFNESS_LIMIT, STIFFNESS_MARGIN, DeviceGasRegions
 from fastfsi.boundary.inlet_air import HARD_STOP_CODES as INLET_AIR_HARD_STOP_CODES
-from fastfsi.boundary.inlet_air import FlowElement, InletAirModel, SeriesRestriction
+from fastfsi.boundary.inlet_air import FlowElement, InletAirModel, SeriesRestriction, check_line_config
 from fastfsi.boundary.solid_occupancy import (DEFAULT_BOX_SAMPLES, DEFAULT_HYSTERESIS_STEPS, DEFAULT_STRETCH_FACTOR,
                                         DEFAULT_SUB, SolidOccupancy)
 from fastfsi.boundary.pressure_regions import DEFAULT_PENALTY_FACTOR, PressureRegions
@@ -448,9 +448,9 @@ class PneumaticChamber:
         if written != self.inlet_air.kind:                                 # refused before anything is loaded
             raise ValueError("the checkpoint was written with the %s inlet; this chamber uses the %s inlet"
                              % (written, self.inlet_air.kind))
-        if written == "capped" and values["inlet_air"].get("line_config") != self.inlet_air.line_config():
-            raise ValueError("the checkpoint's inlet line %s is not this chamber's %s"
-                             % (values["inlet_air"].get("line_config"), self.inlet_air.line_config()))
+        if written == "capped":
+            check_line_config(values["inlet_air"].get("line_config"), self.inlet_air.line_config(),
+                              self.inlet_air.allow_flow_cap_change_on_load, "chamber")
         for prefix, part in self._parts():
             part.load_state_host({name[len(prefix):]: value for name, value in values.items()
                                   if name.startswith(prefix)})

@@ -78,7 +78,9 @@ First version of the package layout `src/fastfsi` (replaces the earlier flat lay
   a gas spring like a pocket: ω = sqrt(p_abs A² / (V m)) from the opt-in inlet-spring sums of
   `DeviceGasRegions(inlet_spring=True)` joins `dt_limit()`.  Its state is checkpointed with the line's parameters
   (`line_config`: a, b, Q_cap, V_line, the elements), and a chamber with the other inlet model or another line refuses
-  the checkpoint; a non-positive absolute pressure is the hard stop `inlet_air_invalid_pressure`.
+  the checkpoint, with one opt-in exception: `InletAirModel.allow_flow_cap_change_on_load` lets the flow cap alone
+  differ (a sensitivity restarted from a run's checkpoint with another cap; the model keeps its own cap and records
+  `flow_cap_change`); a non-positive absolute pressure is the hard stop `inlet_air_invalid_pressure`.
 - Checkpoint / restart: `fastfsi.io.checkpoint` (create-only NPZ checkpoints), `fastfsi.io.restart` (checkpoint
   schedule, manifest checks), `fastfsi.io.run_segments` (joins restarted segments).
 - Turek–Hron example: `--checkpoint-every-s`, `--checkpoint-at`, `--restart-from`, `--diagnostic-restart`; argument

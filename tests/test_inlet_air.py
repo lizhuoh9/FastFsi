@@ -184,6 +184,44 @@ def test_a_checkpoint_of_another_line_is_refused():
         same.load_state_host({k: v for k, v in host.items() if k != "line_config"})
 
 
+def test_a_flow_cap_change_on_load_is_opt_in_and_alone():
+    """The USER's suction sensitivity (2026-10-24, via Root): a restart with another free-flow cap.  The default
+    refuses it; allow_flow_cap_change_on_load accepts the cap alone (any other difference is still refused), the model
+    keeps its own cap, the state is the checkpoint's, and the change is recorded."""
+    model = InletAirModel("capped", restriction=SeriesRestriction([HOLE]), flow_cap_m3_s=CAP)
+    model.start(0.0, 2.0e-5)
+    model.advance(3.0e-5, -40.0e3, 2.0e-5, False, 0.0)            # suction at the checkpoint's cap
+    host = json.loads(json.dumps(model.state_host(), allow_nan=False))
+    low_cap = 0.25 * CAP
+    default = InletAirModel("capped", restriction=SeriesRestriction([HOLE]), flow_cap_m3_s=low_cap)
+    with pytest.raises(ValueError, match="inlet line"):
+        default.load_state_host(host)
+    assert default.q_pa_m3 is None and default.flow_cap_change is None
+    connector = FlowElement("connector bore", "fitting", 1.5e-3)
+    for other in (InletAirModel("capped", restriction=SeriesRestriction([connector, HOLE]), flow_cap_m3_s=low_cap),
+                  InletAirModel("capped", restriction=SeriesRestriction([HOLE]), flow_cap_m3_s=low_cap,
+                                line_volume_m3=1.0e-6),
+                  InletAirModel("capped", restriction=SeriesRestriction([HOLE]), flow_cap_m3_s=low_cap,
+                                ambient_pa=0.9 * P0)):
+        other.allow_flow_cap_change_on_load = True
+        with pytest.raises(ValueError, match="inlet line"):
+            other.load_state_host(host)
+        assert other.q_pa_m3 is None and other.flow_cap_change is None
+    low = InletAirModel("capped", restriction=SeriesRestriction([HOLE]), flow_cap_m3_s=low_cap)
+    low.allow_flow_cap_change_on_load = True
+    low.load_state_host(host)
+    assert low.flow_cap_m3_s == low_cap and low.flow_cap_change == dict(checkpoint_m3_s=CAP, model_m3_s=low_cap)
+    loaded = low.state_host()
+    assert loaded.pop("line_config")["flow_cap_m3_s"] == low_cap
+    assert loaded == {k: v for k, v in host.items() if k != "line_config"}
+    low.advance(3.0e-5, -40.0e3, 2.0e-5, False, 0.0)              # the next step at the new cap
+    assert low.capped and low.q_m3_s == -low_cap
+    same = InletAirModel("capped", restriction=SeriesRestriction([HOLE]), flow_cap_m3_s=CAP)
+    same.allow_flow_cap_change_on_load = True                      # allowed, not used: nothing recorded
+    same.load_state_host(host)
+    assert same.flow_cap_change is None and same.state_host() == model.state_host()
+
+
 def test_a_non_positive_absolute_pressure_is_a_hard_stop():
     model = InletAirModel("capped", hole_a_pa_s_m3=LID_HOLE[0], hole_b_pa_s2_m6=LID_HOLE[1], flow_cap_m3_s=CAP)
     model.start(0.0, 1.0e-5)

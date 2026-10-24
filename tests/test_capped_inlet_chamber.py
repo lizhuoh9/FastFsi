@@ -7,7 +7,9 @@ the region's gas spring: area and footprint mass > 0 once the inlet is open, ome
 the covered start with no inlet air falls back to the line pressure (counted) and the region, once it has volume, starts
     at the line pressure; a covered hole carries the LINE pressure (traction p_line A_hole); the state survives a
     checkpoint (with a connector's bore before the lid hole: the chamber composes the series line; line elements need
-    the capped inlet), and an ideal chamber or one with another line refuses it (Root's review 2026-10-23)."""
+    the capped inlet), and an ideal chamber or one with another line refuses it (Root's review 2026-10-23); a chamber
+    with another flow cap loads it only with inlet_air.allow_flow_cap_change_on_load and runs on at its own cap (the
+    USER's suction sensitivity, 2026-10-24)."""
 import json
 import math
 
@@ -18,6 +20,7 @@ from fastfsi.boundary.inlet_air import FlowElement, SeriesRestriction
 from test_pneumatic_chamber import build, move
 
 CONNECTOR = FlowElement("connector bore", "fitting", 1.5e-3)
+LOW_CAP = 0.02e-3 / 60.0                # 0.02 L/min: below the rig's 0.038 L/min at accepts 6-9, so it binds
 
 STEP = 1.0e-4
 
@@ -133,3 +136,32 @@ def test_the_capped_state_survives_a_checkpoint(tmp_path):
                     "inlet_omega_rad_s"):
             assert r[key] == ref[key], key
     assert chamber.inlet_air.state_host() == straight["chamber"].inlet_air.state_host()
+
+
+def test_a_flow_cap_change_on_load_needs_the_opt_in(tmp_path):
+    from fastfsi.io.checkpoint import load_components, read_checkpoint, write_checkpoint
+    options = dict(inlet_model="capped", inlet_hole_length_m=7.0e-3, inlet_flow_cap_m3_s=8.0e-3 / 60.0)
+    first = build(**options)
+    run(first, accepts=6)
+    path = tmp_path / "capped.npz"
+    write_checkpoint(path, dict(chamber=first["chamber"]), dict(accept=5), dict(rig="capped duct"))
+    arrays, host, _, _, _ = read_checkpoint(path)
+    low = dict(options, inlet_flow_cap_m3_s=LOW_CAP)
+    with pytest.raises(ValueError, match="inlet line"):                     # the default refuses the cap change
+        build(**low)["chamber"].load_state_host(host["chamber"])
+    other = build(**dict(low, inlet_line_elements=(CONNECTOR,)))
+    other["chamber"].inlet_air.allow_flow_cap_change_on_load = True
+    with pytest.raises(ValueError, match="inlet line"):                     # the opt-in allows the cap alone
+        other["chamber"].load_state_host(host["chamber"])
+    restored = build(**low)
+    air = restored["chamber"].inlet_air
+    air.allow_flow_cap_change_on_load = True
+    load_components(dict(chamber=restored["chamber"]), arrays, host)
+    assert air.flow_cap_change == dict(checkpoint_m3_s=8.0e-3 / 60.0, model_m3_s=LOW_CAP)
+    assert air.flow_cap_m3_s == LOW_CAP and air.capped_steps == 0
+    points, chamber, positions = restored["points"], restored["chamber"], restored["positions"]
+    for n in range(6, 10):                                                 # the run on at the new cap
+        move(points, positions, -1.5e-3)
+        r = chamber.accept(STEP * n, line(STEP * n), dt_taken_s=STEP)
+        assert air.capped and r["inlet_q_m3s"] == LOW_CAP, n
+    assert air.capped_steps == 4
