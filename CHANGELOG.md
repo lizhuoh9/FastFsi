@@ -10,6 +10,10 @@ First version of the package layout `src/fastfsi` (replaces the earlier flat lay
   the exact-residual confirmation, the component compatibility measures and the outlet-reachability flood read one
   small device packet per poll instead of host scalar arithmetic.
 - Excess mass for solids denser than the fluid (`fastfsi.coupling.excess_mass`, penalty-spring partner points).
+- Whole-body force (`fastfsi.simulation.body_force.WholeBodyForce`, read-only): the force a fixed body and the solids
+  it holds exert on its mount (a load cell's reading), by control volumes (boxes of cells; a face on the domain's top
+  wall over the body's footprint is the body itself) and by the direct sum (obstacle faces and that lid, minus the
+  direct clamp's and the caller's point forces), as impulse-exact interval means with one host read per report.
 - Held deformation (`ImmersedBoundaryCoupler(held_f="frozen")`, opt-in; the default `"evolve"` is unchanged): the
   direct clamp holds a tethered point's interpolated velocity near 0 while F integrated the interpolated gradient, so a
   held region that does not move carried strain and spread its stress.  Frozen skips the F update of tethered points
