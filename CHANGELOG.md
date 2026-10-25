@@ -31,6 +31,14 @@ First version of the package layout `src/fastfsi` (replaces the earlier flat lay
   Isochoric updates F with the deviatoric gradient G − tr(G)/3 I in both F updates and renormalises it by
   det(F)^(−1/3), so det F = 1 holds to round-off (held points follow `held_f`); `f_update_report()` returns the
   largest |det F − 1| removed since the last read.
+- Rest cap of the wall contact (`PenaltyContact(rest_cap=True)`, opt-in; the default is unchanged): a free point that
+  starts inside its own contact distance of a wall (a coarse wall face next to a clamped edge) was pushed from t = 0
+  with no load.  With the cap every free point's contact distance against the walls is
+  min(d_c,p(n), φ_p(X0) − 1 nm), φ_p(X0) the step kernel's own wall distance at the reference position (the
+  obstacle-face wall distance for the selected body, the signed distance otherwise), evaluated once at construction:
+  no point is in contact at rest, and a point moved from rest toward the wall is pushed with the same stiffness.
+  Points farther than d_c at rest and the lid are unchanged.  `setup_report()['rest_cap']` gives the capped points and
+  those inside a wall at rest (φ(X0) ≤ 0, taken as stress-free).
 - Boundary models: pressure chambers and pressure regions, gas regions and sealed gas pockets (isothermal gas law),
   solid occupancy, and a pneumatic chamber (a pressure inlet through a hole that a solid may cover).
 - Shifted-pressure chambers carry their projection contract (`PROJECT_REQUIREMENTS`: z-min outlet, outlet backflow

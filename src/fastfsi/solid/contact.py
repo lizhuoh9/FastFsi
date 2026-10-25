@@ -35,6 +35,17 @@ OPTIONS (each off by default; off = the base law above):
     zero level inside the obstacle cell, and a point can enter it).
   * STIFFNESS OF ONE BODY (selected_omega_dt): the contact of the points of body selected_body_id (walls and lid) uses
     k = rho_s (selected_omega_dt / dt)^2 (explicit stability needs omega dt < 2).
+  * REST CAP (rest_cap): a point may start inside its own contact distance of a wall (a coarse wall face next to a
+    clamped edge), and the base law pushes it from t = 0 with no load.  With the cap, every non-tethered point's contact
+    distance against the walls is d_c,p = min(d_c,p(n), phi_p(X0) - REST_CAP_MARGIN_M), phi_p(X0) its wall distance at
+    its reference position by the step kernel's own functions (phi_wall for the selected body when
+    selected_wall_on_obstacle_faces, phi otherwise), evaluated once at construction.  No point is in contact at rest;
+    a point moved from rest toward the wall is pushed with the same k once it is REST_CAP_MARGIN_M closer than at
+    rest; a point farther than d_c at rest is unchanged.  The margin (1 nm) keeps a rounding difference between the
+    construction kernel and the step kernel from putting a point in contact at rest.  A point inside a wall at rest
+    (phi(X0) <= 0) is pushed only when it goes deeper: its rest position is taken as stress-free.  The lid is not capped
+    (no material box crosses it at rest: checked at construction).  setup_report()['rest_cap'] gives the capped points
+    and those with phi(X0) <= 0.
   Diagnostics when on: lid force / points / gap / penetration past the plane; the selected body's contact force /
   points, min wall distance, penetration past the wall, and min one-sided interpolation support D of its points in
   contact.
@@ -62,6 +73,7 @@ from fastfsi.geometry.signed_distance import (BAND_CELLS, REACH_MARGIN_M, _axis_
                                               load_or_build_signed_distance, wall_distance_on_obstacle_faces)
 
 CONTACT_OMEGA_DT = 0.25        # tether convention k = rho_s (0.25 / dt)^2
+REST_CAP_MARGIN_M = 1.0e-9     # rest_cap: the cap sits 1 nm under the rest wall distance (rounding between kernels)
 HARD_STOP_CODES = {
     "contact_setup_invalid",      # SDF / geometry inconsistent (construction)
     "contact_nonfinite_state",    # nonfinite phi at a point
@@ -98,14 +110,15 @@ class PenaltyContact(Checkpointable):
     def __init__(self, fluid, axes, coupler, rigid_triangles_m, *, d_c_m=None, k_c=None, solid_density_kgm3=None,
                  band_cells=BAND_CELLS, sample_spacing_m=None, reach_margin_m=REACH_MARGIN_M, sign_from_obstacle=True,
                  sdf_cache_dir=None, lid_z_m=None, selected_wall_on_obstacle_faces=False, selected_body_id=2,
-                 selected_omega_dt=None):
+                 selected_omega_dt=None, rest_cap=False):
         """fluid: the fluid solver (grid, obstacle); axes: the grid axes (.n checked); coupler: the
         ImmersedBoundaryCoupler (its points carry x, X0, vol, tether, body_id, f_extra; its weights and mask give the
         one-sided D of the contact diagnostics); rigid_triangles_m: dict region -> (n, 3, 3) triangles in
         metres, or one array.  k_c None -> rho_s (CONTACT_OMEGA_DT / dt)^2 at each apply_point_forces(dt).  d_c_m None
         -> the support distance of each point's material box along the contact normal.  reach_margin_m None -> exact
         signed distance in the whole band.  lid_z_m: analytic lid plane; selected_wall_on_obstacle_faces / selected_omega_dt: the
-        wall distance on the obstacle faces and the contact stiffness of the points of body selected_body_id."""
+        wall distance on the obstacle faces and the contact stiffness of the points of body selected_body_id.
+        rest_cap: the wall contact distance capped at each point's rest wall distance (module docstring)."""
         self.fluid, self.axes, self.coupler, self.points = fluid, axes, coupler, coupler.points
         grid = fluid.grid
         self.faces = [_axis_faces(grid.bounds_min_m[a], w) for a, w in
@@ -149,6 +162,7 @@ class PenaltyContact(Checkpointable):
             raise SimulationHardStop("contact_setup_invalid", dict(reason=str(error))) from None
         self._setup_points(phi, d_c_m)
         self._setup_options(phi, grid, sign_mask)
+        self._setup_rest_cap(rest_cap)
         self.stats = ti.field(ti.f64, shape=STATS_SLOTS + (OPTION_SLOTS if self.options_on else 0))
         self._init_stats_kernel()
         self._last_report_t = None
@@ -221,6 +235,37 @@ class PenaltyContact(Checkpointable):
             self.phi_wall = ti.field(ti.f32, shape=self.nodes)
             self.phi_wall.from_numpy(wall.astype(np.float32))
             self.options_report["wall_distance_on_obstacle_faces"] = rep
+
+    def _setup_rest_cap(self, on):
+        """rest_cap: every point's cap of its wall contact distance, phi_p(X0) - REST_CAP_MARGIN_M, with phi_p(X0) from
+        the step kernel's own functions at the reference positions (_rest_phi_kernel), and the report (None when off)."""
+        self.rest_cap_on = bool(on)
+        self.rest_cap_report = None
+        if not self.rest_cap_on:
+            return
+        self.rest_cap = ti.field(ti.f32, shape=self.n)
+        rest = ti.field(ti.f32, shape=(self.n, 2))            # phi(X0) and d_c(n(X0)) (-1: the normal is undefined)
+        self._rest_phi_kernel(self.points.X0, rest)
+        values = rest.to_numpy().astype(np.float64)
+        phi0, dc0 = values[:, 0], values[:, 1]
+        if not np.isfinite(phi0).all():
+            raise SimulationHardStop("contact_setup_invalid", dict(reason="a nonfinite wall distance at rest"))
+        cap = (phi0 - REST_CAP_MARGIN_M).astype(np.float32)
+        self.rest_cap.from_numpy(cap)
+        free = np.asarray(self.points.tether.to_numpy()) == 0
+        body = np.asarray(self.points.body_id.to_numpy())
+        capped = free & (dc0 >= 0.0) & (cap.astype(np.float64) < dc0)           # the cap acts at rest
+        inside = free & (phi0 <= 0.0)
+        self.d_c_rule += "; capped at the rest wall distance phi(X0) - %.0e m (rest_cap)" % REST_CAP_MARGIN_M
+        self.rest_cap_report = dict(
+            margin_m=REST_CAP_MARGIN_M, free_points=int(free.sum()), capped_points=int(capped.sum()),
+            rest_phi_le_0_points=int(inside.sum()),
+            capped_rest_phi_m=[float(phi0[capped].min()), float(phi0[capped].max())] if capped.any() else None,
+            rest_phi_le_0_m=[float(phi0[inside].min()), float(phi0[inside].max())] if inside.any() else None,
+            rest_preload_removed_max_m=float((dc0 - phi0)[capped].max()) if capped.any() else 0.0,
+            by_body={str(int(b)): dict(capped_points=int((capped & (body == b)).sum()),
+                                       rest_phi_le_0_points=int((inside & (body == b)).sum()))
+                     for b in np.unique(body[free])})
 
     # ------------------------------------------------------------------------------------------------ kernels
     @ti.func
@@ -345,6 +390,38 @@ class PenaltyContact(Checkpointable):
         return d
 
     @ti.func
+    def _wall_contact_distance(self, p, nrm):
+        """Contact distance of point p against the walls: _contact_distance, capped at the point's rest wall distance
+        (less REST_CAP_MARGIN_M) when rest_cap is on.  The lid keeps _contact_distance."""
+        d = self._contact_distance(p, nrm)
+        if ti.static(self.rest_cap_on):
+            d = ti.min(d, self.rest_cap[p])
+        return d
+
+    @ti.kernel
+    def _rest_phi_kernel(self, X0: ti.template(), out: ti.template()):
+        """rest_cap: each point's wall distance and contact distance at its reference position, by the step kernel's
+        own functions (the base phi, or the per-point wall phi when an option is on)."""
+        for p in range(self.n):
+            phi = 0.0
+            g = ti.Vector([0.0, 0.0, 0.0])
+            if ti.static(not self.options_on):
+                a, b = self._phi_grad(X0[p])
+                phi = a
+                g = b
+            else:
+                a, b = self._wall_phi_grad(p, X0[p])
+                phi = a
+                g = b
+            dc = -1.0
+            gn = g.norm()
+            if gn > 1.0e-6:
+                nrm = g / gn
+                dc = self._contact_distance(p, nrm)
+            out[p, 0] = phi
+            out[p, 1] = dc
+
+    @ti.func
     def _contact_area(self, p, nrm):
         """Area of the material box of point p projected along the unit normal (its touching face for an
         axis-aligned contact)."""
@@ -383,7 +460,7 @@ class PenaltyContact(Checkpointable):
                     gn = g.norm()
                     if gn > 1.0e-6:
                         nrm = g / gn
-                        dc = self._contact_distance(p, nrm)
+                        dc = self._wall_contact_distance(p, nrm)
                         if phi < dc:
                             mag = k_c * vol[p] * (dc - phi)
                             f = f_extra[p]
@@ -402,7 +479,7 @@ class PenaltyContact(Checkpointable):
                     gn = g.norm()
                     if gn > 1.0e-6:
                         nrm = g / gn
-                        dc = self._contact_distance(p, nrm)
+                        dc = self._wall_contact_distance(p, nrm)
                         if phi < dc:
                             mag = k_p * vol[p] * (dc - phi)
                             f = f_extra[p]
@@ -474,7 +551,7 @@ class PenaltyContact(Checkpointable):
                 gn = g.norm()
                 if gn > 1.0e-6:
                     nrm = g / gn
-                    dc = self._contact_distance(p, nrm)
+                    dc = self._wall_contact_distance(p, nrm)
                     if phi < dc:
                         depth = ti.cast(dc - phi, ti.f64)
                         mag = ti.cast(k_p * vol[p], ti.f64) * depth
@@ -515,7 +592,7 @@ class PenaltyContact(Checkpointable):
             ti.atomic_max(self.stats[V_M_SEL_MAX_PEN], ti.cast(ti.max(-phi, 0.0), ti.f64))
             gn = g.norm()
             if gn > 1.0e-6:
-                dc = self._contact_distance(p, g / gn)
+                dc = self._wall_contact_distance(p, g / gn)
                 if phi < dc:
                     ti.atomic_add(self.stats[V_M_SEL_FORCE], ti.cast(k_p * vol[p], ti.f64) * ti.cast(dc - phi, ti.f64))
                     ti.atomic_add(self.stats[V_M_SEL_POINTS], 1.0)
@@ -587,10 +664,13 @@ class PenaltyContact(Checkpointable):
         return out
 
     def setup_report(self):
-        return dict(sdf=self.sdf_report, d_c_rule=self.d_c_rule,
-                    d_c_range_m=list(self.d_c_range_m), half_extent_z_range_m=list(self.half_extent_z_range_m),
-                    k_c=self.k_c, friction="none (normal only)", adhesion="none (repulsive only)", damping="none",
-                    options=self.options_report)
+        out = dict(sdf=self.sdf_report, d_c_rule=self.d_c_rule,
+                   d_c_range_m=list(self.d_c_range_m), half_extent_z_range_m=list(self.half_extent_z_range_m),
+                   k_c=self.k_c, friction="none (normal only)", adhesion="none (repulsive only)", damping="none",
+                   options=self.options_report)
+        if self.rest_cap_on:
+            out["rest_cap"] = self.rest_cap_report
+        return out
 
     def close(self):
         return None
