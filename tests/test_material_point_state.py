@@ -303,3 +303,27 @@ def test_nan_scratch_restore_is_rewritten_by_real_3d_gather():
         assert np.allclose(points.v.to_numpy(), expected_v, atol=2e-7, rtol=0.)
         assert clean == {name: getattr(points, name).to_numpy().tobytes() for name in clean}
         assert points.state_array_names() == fields == ("u", "F", "f_extra")
+
+
+@pytest.mark.parametrize("dim,bad,match", (
+    (3, dict(volumes_m3=[1.0, np.inf, 1.0]), "volumes"),                 # inf passed "> 0"
+    (3, dict(volumes_m3=[1.0, 1.0e40, 1.0]), "volumes"),                 # inf in float32
+    (3, dict(positions_m=[[0.0, 0.0, 0.0], [np.nan, 0.0, 0.0], [1.0, 0.0, 0.0]]), "positions"),
+    (3, dict(external_force_n=[[0.0, 0.0, 0.0], [0.0, np.inf, 0.0], [0.0, 0.0, 0.0]]), "external force"),
+    (2, dict(areas_m2=[1.0, -1.0, 1.0]), "areas"),                       # a negative mass before
+    (2, dict(areas_m2=[1.0, 1.0]), "one entry per point"),
+    (2, dict(positions_yz_m=np.zeros((3, 3))), r"\(n, 2\)"),
+))
+def test_invalid_point_inputs_are_refused_before_any_field_exists(dim, bad, match):
+    """Codex review 2026-10-26 (checked by Root): the inputs are checked after the float32 conversion."""
+    material = NeoHookeanMaterial(1000.0, 1.0, 10.0)
+    if dim == 2:
+        args = dict(positions_yz_m=np.zeros((3, 2)), areas_m2=np.ones(3), material=material,
+                    tether_mask=np.zeros(3, np.int32))
+        cls = PlanarMaterialPoints
+    else:
+        args = dict(positions_m=np.zeros((3, 3)), volumes_m3=np.ones(3), material=material,
+                    tether_mask=np.zeros(3, np.int32))
+        cls = MaterialPoints
+    with pytest.raises(ValueError, match=match):
+        cls(**dict(args, **bad))

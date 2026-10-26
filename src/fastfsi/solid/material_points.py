@@ -142,8 +142,16 @@ class MaterialPoints(Checkpointable):
         tether = np.asarray(tether_mask, dtype=np.int32)
         if volumes.shape != (n,) or tether.shape != (n,):
             raise ValueError("volumes and tether mask must have one entry per point")
-        if not np.all(volumes > 0.0):
-            raise ValueError("point volumes must be positive")
+        # checked after the float32 conversion: a value beyond float32's range arrives as inf, a tiny volume as 0
+        if not np.all(np.isfinite(positions)):
+            raise ValueError("point positions must be finite in float32")
+        if not np.all(np.isfinite(volumes) & (volumes > 0.0)):
+            raise ValueError("point volumes must be finite and positive in float32")
+        ext = np.zeros((n, 3), np.float32) if external_force_n is None else np.asarray(external_force_n, np.float32)
+        if ext.shape != (n, 3):
+            raise ValueError("external force must be (n, 3)")
+        if not np.all(np.isfinite(ext)):
+            raise ValueError("the external force must be finite in float32")
         self.material = material
         self.n = n
         self.rho_s = float(material.density_kgm3)
@@ -190,9 +198,6 @@ class MaterialPoints(Checkpointable):
         self.tag.from_numpy(np.zeros(n, np.int32) if tag is None else np.asarray(tag, np.int32))
         self.near_surface.from_numpy(np.zeros(n, np.int32) if near_surface_mask is None
                                      else np.asarray(near_surface_mask, dtype=np.int32))
-        ext = np.zeros((n, 3), np.float32) if external_force_n is None else np.asarray(external_force_n, np.float32)
-        if ext.shape != (n, 3):
-            raise ValueError("external force must be (n, 3)")
         self.f_ext.from_numpy(ext)
         self.f_extra.fill(0.0)
 
@@ -347,9 +352,20 @@ class PlanarMaterialPoints(Checkpointable):
 
     def __init__(self, *, positions_yz_m, areas_m2, material, tether_mask, near_surface_mask=None):
         positions = np.asarray(positions_yz_m, dtype=np.float32)
+        if positions.ndim != 2 or positions.shape[1] != 2:
+            raise ValueError("PlanarMaterialPoints needs an (n, 2) array of (y, z) positions")
         n = len(positions)
         if n == 0:
             raise ValueError("PlanarMaterialPoints needs material points")
+        areas = np.asarray(areas_m2, dtype=np.float32)
+        tether = np.asarray(tether_mask, dtype=np.int32)
+        if areas.shape != (n,) or tether.shape != (n,):
+            raise ValueError("areas and tether mask must have one entry per point")
+        # checked after the float32 conversion (as MaterialPoints): a negative area would be a negative mass
+        if not np.all(np.isfinite(positions)):
+            raise ValueError("point positions must be finite in float32")
+        if not np.all(np.isfinite(areas) & (areas > 0.0)):
+            raise ValueError("point areas must be finite and positive in float32")
         self.material = material
         self.n = n
         self.rho_s = float(material.density_kgm3)
@@ -371,8 +387,8 @@ class PlanarMaterialPoints(Checkpointable):
         self.X0.from_numpy(positions)
         self.v.fill(0.0)
         self.F.from_numpy(np.tile(np.eye(2, dtype=np.float32), (n, 1, 1)))
-        self.area.from_numpy(np.asarray(areas_m2, dtype=np.float32))
-        self.tether.from_numpy(np.asarray(tether_mask, dtype=np.int32))
+        self.area.from_numpy(areas)
+        self.tether.from_numpy(tether)
         self.near_surface.from_numpy(np.zeros(n, np.int32) if near_surface_mask is None
                                      else np.asarray(near_surface_mask, dtype=np.int32))
 

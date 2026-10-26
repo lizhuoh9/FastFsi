@@ -66,6 +66,9 @@ INLET_MODELS = ("ideal", "capped")
 LPM_TO_M3_S = 1.0e-3 / 60.0        # L/min of free air to m^3/s
 FALLBACK_LOG_MAX = 50
 HARD_STOP_CODES = {"inlet_air_invalid_pressure"}
+# the line_config entries of the line's air (recorded since 2026-10-26) and the values every earlier checkpoint ran with
+LINE_AIR_DEFAULTS = dict(air_density_kg_m3=AIR_DENSITY_KG_M3, air_viscosity_pa_s=AIR_VISCOSITY_PA_S,
+                         laminar_reynolds_max=LAMINAR_REYNOLDS_MAX)
 
 
 def hole_law(diameter_m, length_m, *, viscosity_pa_s=AIR_VISCOSITY_PA_S, density_kg_m3=AIR_DENSITY_KG_M3,
@@ -231,7 +234,11 @@ class SeriesRestriction:
 
 def check_line_config(saved, line, allow_flow_cap_change=False, holder="model"):
     """A checkpoint's inlet line (saved) against this one (line): None when equal; with allow_flow_cap_change, the pair
-    (saved cap, this cap) in m^3/s (None: no cap) when the flow cap alone differs; else ValueError."""
+    (saved cap, this cap) in m^3/s (None: no cap) when the flow cap alone differs; else ValueError.  A checkpoint
+    written before the line recorded its air (LINE_AIR_DEFAULTS' keys) ran with those defaults: it matches a line at
+    the defaults only."""
+    if isinstance(saved, dict) and not any(key in saved for key in LINE_AIR_DEFAULTS):
+        saved = dict(saved, **LINE_AIR_DEFAULTS)
     if saved == line:
         return None
     if (allow_flow_cap_change and isinstance(saved, dict) and set(saved) == set(line)
@@ -307,11 +314,15 @@ class InletAirModel:
         return self.kind == "capped"
 
     def line_config(self):
-        """The line's parameters a checkpoint must match (JSON-ready: no inf, lists)."""
+        """The line's parameters a checkpoint must match (JSON-ready: no inf, lists).  The air's density and viscosity
+        and the hoses' Reynolds limit are recorded too: a and b miss the limit, and the turbulent law uses all three."""
+        restriction = self.restriction
         return dict(kind=self.kind, a_pa_s_m3=self.hole_a, b_pa_s2_m6=self.hole_b,
                     flow_cap_m3_s=self.flow_cap_m3_s if math.isfinite(self.flow_cap_m3_s) else None,
                     line_volume_m3=self.line_volume_m3, ambient_pa=self.ambient_pa,
-                    elements=[[e.name, e.kind, e.diameter_m, e.length_m] for e in self.restriction.elements])
+                    elements=[[e.name, e.kind, e.diameter_m, e.length_m] for e in restriction.elements],
+                    air_density_kg_m3=restriction.density_kg_m3, air_viscosity_pa_s=restriction.viscosity_pa_s,
+                    laminar_reynolds_max=restriction.laminar_reynolds_max)
 
     def describe(self):
         """The model's parameters (run_meta / setup report)."""

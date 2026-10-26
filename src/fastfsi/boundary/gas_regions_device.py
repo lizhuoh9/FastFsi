@@ -205,6 +205,9 @@ class DeviceGasRegions(Checkpointable):
         self.type_memory = bool(type_memory)
         if self.seal_steps < 1 or self.min_cells < 1 or self.raster_interval < 1:
             raise ValueError("seal_steps, min_cells and raster_interval must be >= 1")
+        # flood_batch 0 would end the flood after its seeds (no level runs, the frontier reads 0), staging 0 never stages
+        if self.max_pockets < 1 or self.flood_batch < 1 or self.staging < 1:
+            raise ValueError("max_pockets, flood_batch and staging must be >= 1")
         cells = int(np.prod(shape))
         self.wall = ti.field(ti.i32, shape=shape)
         self.wall.from_numpy(wall.astype(np.int32))

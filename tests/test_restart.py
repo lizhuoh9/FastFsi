@@ -140,7 +140,8 @@ def test_example_restart_arguments(tmp_path):
                        "--checkpoint-at", "0.1", "--checkpoint-at", "0.6"])
     assert a.checkpoint_every_s == 0.25 and a.checkpoint_at == [0.1, 0.6] and a.restart_from is None
     assert a.kappa_over_mu is None                  # resolved from the preset's Poisson ratio at the start of main()
-    for bad in (["--diagnostic-restart"], ["--checkpoint-every-s", "-1"]):
+    for bad in (["--diagnostic-restart"], ["--checkpoint-every-s", "-1"], ["--end-time", "nan"], ["--dt-max", "0"],
+                ["--cfl-elastic", "-0.3"], ["--row-interval", "0"], ["--vtk-interval-s", "nan"]):
         with pytest.raises(SystemExit):
             example.parse(["--end-time", "1", "--output", str(tmp_path)] + bad)
     assert set(example.RESTART_FREE_ARGS) <= set(vars(a))

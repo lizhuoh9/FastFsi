@@ -120,3 +120,21 @@ First version of the package layout `src/fastfsi` (replaces the earlier flat lay
   `TaichiRuntimeConfig.cpu_max_num_threads` sets the CPU thread count.
 - Tests: checkpoint / restart split runs, a golden regression of short Turek–Hron runs, the import graph, field and
   signature contracts, and unit tests of the excess mass, gas pockets and boundary models.
+- Call guards and input checks (an external code review of 4eaf54a, each finding checked against the code; results of
+  supported calls are unchanged):
+  - `predict()`, `project()` and `apply_body_force()` default to their supported paths (`muscl_tvd`, `fv_cg`, failure
+    policy `raise`, no per-call report; the old defaults always raised), and refuse a removed option before any state
+    changes (before, `apply_body_force(read_report=True)` updated the velocity and then raised, and `project()` applied
+    its velocity rows before its first refusal).
+  - `MaterialPoints` / `PlanarMaterialPoints` check after the float32 conversion that positions, volumes / areas and
+    external forces are finite and volumes / areas positive (an infinite volume passed, a planar area was unchecked).
+  - The SDF cache key reads `band_cells` as the float the build uses and the sign mask as nonzero = inside (a fractional
+    band and a mask of 256s shared other inputs' keys); a cache file is written privately and published by a hard link,
+    so a failed write leaves nothing under the cache name.
+  - `write_checkpoint` publishes by a hard link, so a file that appears while a checkpoint is written is never replaced
+    (os.replace overwrote it).
+  - The capped inlet's `line_config` records the air's density and viscosity and the hoses' Reynolds limit (a and b do
+    not hold the limit); a checkpoint written before matches a line at the defaults only.
+  - `DeviceGasRegions` refuses `max_pockets`, `flood_batch` or `staging` below 1 (`flood_batch` 0 ended the flood at its
+    seeds); the Turek–Hron example refuses a non-positive or non-finite end time, dt-max, CFL numbers or spacing, a row
+    interval or CG iteration count below 1, and a non-finite VTK interval before it creates the output.

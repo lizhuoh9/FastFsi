@@ -396,3 +396,11 @@ def test_restart_while_covered_keeps_the_cover():
     assert again["topology"] is None and again["inlet_covered"] and again["inlet_air_cells"] == 0
     assert np.array_equal(other.device.codes(), pair.device.codes())
     assert np.array_equal(other.device.pocket_table()["q_pa_m3"], pair.device.pocket_table()["q_pa_m3"])
+
+
+@pytest.mark.parametrize("option", ("max_pockets", "flood_batch", "staging"))
+def test_zero_sizes_are_refused(option):
+    """Codex review 2026-10-26 (checked by Root): flood_batch 0 ended the flood after its seed cells and left the inlet
+    air unconnected; the sizes are checked before any field exists."""
+    with pytest.raises(ValueError, match="must be >= 1"):
+        Pair(**{option: 0})

@@ -162,6 +162,22 @@ def test_a_corrupted_array_is_refused(tmp_path):
         read_checkpoint(damaged)
 
 
+def test_a_checkpoint_never_replaces_a_file_that_appears_while_it_is_written(tmp_path):
+    """Codex review 2026-10-26 (checked by Root): the start's existence check left a window, and os.replace overwrote a
+    file another writer created in it.  The hard-link publish refuses it and keeps the new checkpoint as .partial."""
+    path = tmp_path / "state.npz"
+
+    class Racer:                                       # another writer takes the name while this one writes
+        def state_arrays(self):
+            path.write_bytes(b"the other writer")
+            return {"u": np.zeros(3, np.float32)}
+
+    with pytest.raises(FileExistsError, match="appeared while it was written"):
+        write_checkpoint(path, dict(points=Racer()), {}, {})
+    assert path.read_bytes() == b"the other writer"
+    assert read_checkpoint(tmp_path / "state.npz.partial")[0]["points"]["u"].tolist() == [0.0, 0.0, 0.0]
+
+
 def test_components_must_match_exactly(tmp_path):
     component, _, _ = make_components()
     path = tmp_path / "state.npz"

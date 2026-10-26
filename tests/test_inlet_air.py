@@ -11,8 +11,8 @@ import numpy as np
 import pytest
 
 from fastfsi.boundary.gas_pockets import P_ATMOSPHERE_PA
-from fastfsi.boundary.inlet_air import (AIR_DENSITY_KG_M3, AIR_VISCOSITY_PA_S, SOUND_SPEED_M_S, FlowElement,
-                                        InletAirModel, LPM_TO_M3_S, SeriesRestriction, hole_law,
+from fastfsi.boundary.inlet_air import (AIR_DENSITY_KG_M3, AIR_VISCOSITY_PA_S, LINE_AIR_DEFAULTS, SOUND_SPEED_M_S,
+                                        FlowElement, InletAirModel, LPM_TO_M3_S, SeriesRestriction, hole_law,
                                         hole_pressure_drop_pa, solve_hole_flow)
 from fastfsi.errors import SimulationHardStop
 
@@ -182,6 +182,32 @@ def test_a_checkpoint_of_another_line_is_refused():
     assert same.state_host() == model.state_host()
     with pytest.raises(ValueError, match="inlet line"):          # a state without its line
         same.load_state_host({k: v for k, v in host.items() if k != "line_config"})
+
+
+def test_the_line_records_its_air_and_an_older_checkpoint_matches_the_defaults_only():
+    """Codex review 2026-10-26 (checked by Root): a and b do not hold the hoses' Reynolds limit, so a checkpoint of
+    another limit loaded although the turbulent law differs.  line_config records the air and the limit; a checkpoint
+    written before (no such entries) ran with the defaults and loads into a line at the defaults only."""
+    hose = FlowElement("hose", "tube", 2.0e-3, 0.3)
+
+    def model(**air):
+        return InletAirModel("capped", restriction=SeriesRestriction([hose, HOLE], **air), flow_cap_m3_s=CAP)
+
+    written = model()
+    written.start(0.0, 2.0e-5)
+    written.advance(3.0e-5, 5.0e3, 2.0e-5, False, 0.0)
+    host = json.loads(json.dumps(written.state_host(), allow_nan=False))
+    assert {k: host["line_config"][k] for k in LINE_AIR_DEFAULTS} == LINE_AIR_DEFAULTS
+    other = model(laminar_reynolds_max=500.0)
+    assert (other.hole_a, other.hole_b) == (written.hole_a, written.hole_b)      # a and b cannot tell them apart
+    with pytest.raises(ValueError, match="inlet line"):
+        other.load_state_host(host)
+    older = dict(host, line_config={k: v for k, v in host["line_config"].items() if k not in LINE_AIR_DEFAULTS})
+    same = model()
+    same.load_state_host(older)
+    assert same.state_host() == written.state_host()
+    with pytest.raises(ValueError, match="inlet line"):
+        model(laminar_reynolds_max=500.0).load_state_host(older)
 
 
 def test_a_flow_cap_change_on_load_is_opt_in_and_alone():

@@ -209,8 +209,26 @@ def write_checkpoint(path, components, loop_state, manifest):
         header = dict(format=FORMAT, created_utc=datetime.datetime.now(datetime.timezone.utc).isoformat(),
                       loop_state=encoded_loop, host_state=encoded_host, manifest=manifest, arrays=table)
         archive.writestr(HEADER, json.dumps(header, indent=1, sort_keys=True, allow_nan=False))
-    os.replace(partial, path)
+    _publish_create_only(partial, path)
     return header
+
+
+def _publish_create_only(partial, path):
+    """Give the finished .partial its final name without ever replacing a file: a hard link fails if `path` appeared
+    while the checkpoint was written (FileExistsError; the .partial stays for inspection), where os.replace would have
+    overwritten it.  A file system without hard links falls back to the re-checked rename."""
+    try:
+        os.link(partial, path)
+    except FileExistsError:
+        raise FileExistsError("checkpoint %s appeared while it was written; checkpoints are create-only (the new one "
+                              "is kept as %s)" % (path, partial)) from None
+    except OSError:
+        if path.exists():
+            raise FileExistsError("checkpoint %s appeared while it was written; checkpoints are create-only (the new "
+                                  "one is kept as %s)" % (path, partial)) from None
+        os.replace(partial, path)
+        return
+    os.unlink(partial)
 
 
 def read_checkpoint(path):

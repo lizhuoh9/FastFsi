@@ -2200,7 +2200,7 @@ class IncompressibleFluidSolver(Checkpointable, MomentumAdvection, ObstacleMask,
         self,
         dt_s: float | None = None,
         *,
-        advection_scheme: str = "euler",
+        advection_scheme: str = "muscl_tvd",
         kinematic_viscosity_m2_s: float | None = None,
         no_slip_domain_walls: tuple[bool, bool, bool, bool, bool, bool] | None = None,
         pressure_outlet_zmin: bool = False,
@@ -2227,6 +2227,9 @@ class IncompressibleFluidSolver(Checkpointable, MomentumAdvection, ObstacleMask,
         scheme = str(advection_scheme).lower()
         if scheme not in {"euler", "rk2", "muscl_tvd"}:
             raise ValueError(f"unsupported advection_scheme: {advection_scheme!r}")
+        if scheme != "muscl_tvd":
+            # refused before any bookkeeping or kernel (the removed schemes' branch below would raise after them)
+            raise NotImplementedError("advection_scheme must be 'muscl_tvd'")
         nu_m2_s = (
             dynamic_viscosity_pa_s / density_kgm3
             if kinematic_viscosity_m2_s is None
@@ -2585,8 +2588,11 @@ class IncompressibleFluidSolver(Checkpointable, MomentumAdvection, ObstacleMask,
         self,
         dt_s: float | None = None,
         *,
-        read_report: bool = True,
+        read_report: bool = False,
     ) -> None:
+        if read_report:
+            # refused before the velocity update: a caller that retries without the report must not apply it twice
+            raise NotImplementedError("per-call solver reports (read_report=True) are not supported; use compute_divergence() and the simulation monitors")
         step_dt_s = _finite_float(
             self.dt if dt_s is None else dt_s,
             name="dt_s",
@@ -2603,9 +2609,6 @@ class IncompressibleFluidSolver(Checkpointable, MomentumAdvection, ObstacleMask,
             step_dt_s,
             density_kgm3,
         )
-        if not read_report:
-            return None
-        raise NotImplementedError("per-call solver reports (read_report=True) are not supported; use compute_divergence() and the simulation monitors")
 
     @ti.kernel
     def _compute_divergence_kernel(
@@ -2769,16 +2772,16 @@ class IncompressibleFluidSolver(Checkpointable, MomentumAdvection, ObstacleMask,
         divergence_cleanup_relaxation: float = 0.7,
         reset_pressure: bool = False,
         accumulate_pressure_into_previous: bool = False,
-        pressure_solver: str = "jacobi",
+        pressure_solver: str = "fv_cg",
         multigrid_cycles: int | None = None,
         cg_tolerance: float = 1.0e-6,
         cg_preconditioner: str = "auto",
-        pressure_solve_failure_policy: str = "report",
+        pressure_solve_failure_policy: str = "raise",
         pressure_solve_context: Mapping[str, object] | None = None,
         tiny_unreached_cleanup_component_cells: int = 0,
         pressure_reachability_prepared: bool = False,
         pre_projection_velocity_projector: object | None = None,
-        read_report: bool = True,
+        read_report: bool = False,
         # Opt-in CG initial-guess warm start (perf only; see
         # invalidate_pressure_warmstart() for the stash-lifetime contract).
         # -1 (default) never touches the stash and adds zero kernel
@@ -2917,6 +2920,9 @@ class IncompressibleFluidSolver(Checkpointable, MomentumAdvection, ObstacleMask,
                 f"got {warm_start_slot_index}"
             )
         report_requested = bool(read_report)
+        if report_requested:
+            # refused before any state change: the first report branch below runs after the velocity rows are applied
+            raise NotImplementedError("per-call solver reports (read_report=True) are not supported; use compute_divergence() and the simulation monitors")
         reachability_prepared = bool(pressure_reachability_prepared)
         pressure_marker_nullspace_report: dict[str, object] = {
             "pressure_marker_nullspace_enabled": bool(
@@ -3026,6 +3032,9 @@ class IncompressibleFluidSolver(Checkpointable, MomentumAdvection, ObstacleMask,
             pressure_solver_force_reason = PRESSURE_INTERFACE_MATRIX_FV_CG_FORCE_REASON
             if pressure_solver_force_reason not in pressure_solver_force_reasons:
                 pressure_solver_force_reasons.append(pressure_solver_force_reason)
+        if pressure_solver_name != "fv_cg":
+            # refused before any state change: the solve itself refuses every other solver after the velocity rows
+            raise NotImplementedError("pressure_solver must be 'fv_cg' (conjugate gradient with a multigrid preconditioner; hypre can replace its linear solve)")
         if pressure_velocity_nullspace_projector is not None:
             raise NotImplementedError("a pressure_velocity_nullspace_projector is not supported")
         # A positive interface diagonal is not by itself a pressure-to-ground

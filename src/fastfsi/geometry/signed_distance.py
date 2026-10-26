@@ -22,6 +22,8 @@ cKDTree finds the candidate triangles.
 import hashlib
 import json
 import math
+import os
+import tempfile
 import time
 from pathlib import Path
 
@@ -280,7 +282,8 @@ def signed_distance_cache_key(rigid_triangles_m, grid, *, band_cells=BAND_CELLS,
         h.update(len(data).to_bytes(8, "little"))
         h.update(data)
     add("version", SDF_CACHE_VERSION.encode())
-    add("params", json.dumps([int(band_cells), None if sample_spacing_m is None else float(sample_spacing_m),
+    # band_cells as the float the build uses (int() made 0.1 and 0.9 one key)
+    add("params", json.dumps([float(band_cells), None if sample_spacing_m is None else float(sample_spacing_m),
                               None if reach_margin_m is None else float(reach_margin_m)]).encode())
     for name, tri in _as_region_dict(rigid_triangles_m):
         add("region", name.encode())
@@ -289,14 +292,18 @@ def signed_distance_cache_key(rigid_triangles_m, grid, *, band_cells=BAND_CELLS,
         add("faces", np.ascontiguousarray(faces, dtype=np.float64).tobytes())
     add("reach", b"none" if reach_points_m is None else
         np.ascontiguousarray(reach_points_m, dtype=np.float64).tobytes())
-    add("sign", b"cad" if sign_mask is None else np.ascontiguousarray(sign_mask, dtype=np.uint8).tobytes())
+    # the mask as the build reads it (nonzero = inside): a uint8 cast wraps 256 to 0
+    add("sign", b"cad" if sign_mask is None else
+        np.ascontiguousarray(np.asarray(sign_mask).astype(bool), dtype=np.uint8).tobytes())
     return h.hexdigest()
 
 
 def load_or_build_signed_distance(cache_dir, rigid_triangles_m, grid, **kwargs):
     """build_signed_distance with an on-disk cache keyed by signed_distance_cache_key (build once, reuse in later
-    runs).  Hit: the stored phi and report (report['cache'] = 'hit').  Miss: build, then write the file create-only
-    (mode 'x'; an existing file is never overwritten, a concurrent writer's file is left alone)."""
+    runs).  Hit: the stored phi and report (report['cache'] = 'hit').  Miss: build, write a private temporary file in
+    the cache directory, then publish it create-only by a hard link (an existing file is never overwritten, a
+    concurrent writer's file is left alone, and a write that fails half-way never appears under the cache name; a file
+    system without hard links leaves the cache unwritten)."""
     cache_dir = Path(cache_dir)
     key = signed_distance_cache_key(rigid_triangles_m, grid, **kwargs)
     path = cache_dir / ("sdf_%s.npz" % key[:40])
@@ -310,10 +317,17 @@ def load_or_build_signed_distance(cache_dir, rigid_triangles_m, grid, **kwargs):
         return phi, report
     phi, report = build_signed_distance(rigid_triangles_m, grid, **kwargs)
     cache_dir.mkdir(parents=True, exist_ok=True)
+    handle, temporary = tempfile.mkstemp(prefix=path.name + ".", suffix=".partial", dir=cache_dir)
     try:
-        with path.open("xb") as stream:
+        with os.fdopen(handle, "wb") as stream:
             np.savez(stream, phi=phi, report_json=json.dumps(report), key=key)
-        state = "miss (written)"
-    except FileExistsError:
-        state = "miss (file appeared meanwhile; kept)"
+        try:
+            os.link(temporary, path)
+            state = "miss (written)"
+        except FileExistsError:
+            state = "miss (file appeared meanwhile; kept)"
+        except OSError as error:
+            state = "miss (not cached: no hard link, %s)" % type(error).__name__
+    finally:
+        os.unlink(temporary)
     return phi, dict(report, cache=state, cache_path=str(path), cache_key=key)

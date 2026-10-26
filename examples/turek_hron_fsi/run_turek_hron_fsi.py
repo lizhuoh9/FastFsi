@@ -160,6 +160,16 @@ def parse(argv):
         p.error("--diagnostic-restart needs --restart-from")
     if not (math.isfinite(a.checkpoint_every_s) and a.checkpoint_every_s >= 0.0):
         p.error("--checkpoint-every-s must be finite and >= 0")
+    # refused before the output directory and the solver exist: a step dt of 0 (a CFL or dt-max of 0) never advances,
+    # a NaN end time never starts, a row interval of 0 divides by zero
+    for name in ("end_time", "dt_max", "cfl_elastic", "cfl_advective", "spacing_over_h"):
+        value = getattr(a, name)
+        if not (math.isfinite(value) and value > 0.0):
+            p.error("--%s must be finite and > 0" % name.replace("_", "-"))
+    if a.row_interval < 1 or a.cg_iterations < 1:
+        p.error("--row-interval and --cg-iterations must be >= 1")
+    if not (math.isfinite(a.vtk_interval_s) and a.vtk_interval_s >= 0.0):
+        p.error("--vtk-interval-s must be finite and >= 0")
     return a
 
 
