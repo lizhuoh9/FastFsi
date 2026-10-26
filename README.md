@@ -9,13 +9,13 @@ immersed boundary. This is research code: it is tested for consistency, not vali
 | Package | Contents |
 |---|---|
 | `fastfsi.fluid` | Incompressible Navier–Stokes on a graded Cartesian MAC grid: MUSCL-TVD momentum advection, viscous terms, projection with a multigrid-preconditioned conjugate-gradient pressure solve (optionally hypre PFMG), a pressure outlet with outlet-reachability marking, velocity Dirichlet faces and obstacle masks. On CUDA the solver's scalar convergence checks run on the device (`device_*` modules). |
-| `fastfsi.solid` | Material points with a neo-Hookean material in 3-D and in a plane (quasi-2-D), state guards (a non-finite state or J ≤ 0 stops the run), penalty contact against rigid level sets. |
-| `fastfsi.coupling` | The immersed-boundary coupling (IB_4 or IB_3 regularized delta), explicit Euler or the midpoint rule, clamps by direct forcing or penalty tethers, and the excess mass of solids denser than the fluid (penalty-spring partner points). |
-| `fastfsi.boundary` | Pressure chambers and per-cell pressure regions, gas regions and sealed gas pockets (isothermal gas law), the solid occupancy of grid cells, and a pneumatic chamber: a pressure inlet through a hole that a solid may cover. |
+| `fastfsi.solid` | Material points with a neo-Hookean material in 3-D and in a plane (quasi-2-D), state guards (a non-finite state or J ≤ 0 stops the run), penalty contact against rigid level sets (opt-in: each point's contact distance capped at its rest distance to the walls, so nothing is in contact at rest). |
+| `fastfsi.coupling` | The immersed-boundary coupling (IB_4 or IB_3 regularized delta), explicit Euler or the midpoint rule, clamps by direct forcing or penalty tethers, the excess mass of solids denser than the fluid (penalty-spring partner points), and opt-in variants of the deformation-gradient update (isochoric; held points kept at F = I). |
+| `fastfsi.boundary` | Pressure chambers and per-cell pressure regions, gas regions and sealed gas pockets (isothermal gas law), the solid occupancy of grid cells, and a pneumatic chamber: a pressure inlet through a hole that a solid may cover, either ideal (the line pressure at the hole) or capped (opt-in: the inlet air's own isothermal mass balance behind a series line of round passages, with a free-flow cap). |
 | `fastfsi.geometry` | Signed distance and masks of closed triangulated solids. |
 | `fastfsi.grid` | Graded Cartesian grids and the fluid-domain specification. |
 | `fastfsi.io` | Create-only checkpoints (NPZ, a sha256 per array, type-exact host state, no pickle), restart checks, the joining of restarted segments, and VTK output for ParaView. |
-| `fastfsi.simulation` | Taichi runtime set-up and monitors (control-volume forces). |
+| `fastfsi.simulation` | Taichi runtime set-up and monitors: control-volume forces, and the read-only whole-body force that a fixed body and the solids it holds exert on its mount (a load cell's reading). |
 
 ## Installation
 
@@ -110,12 +110,16 @@ computations (second table).
 - **Incompressible immersed solid.** The single-velocity coupling moves the solid with the divergence-free fluid
   velocity, so J stays close to 1 and the volumetric modulus mainly limits drift. The Turek–Hron beam (Saint
   Venant–Kirchhoff, ν = 0.4) is compressible; the immersed beam bends stiffer (higher frequency, smaller amplitude).
+- **Deformation-gradient drift.** The default F update integrates the interpolated velocity gradient, which is not
+  trace-free, so the stored det F drifts from the point cloud's own volume over long runs (the history reports the
+  range of J). The opt-in isochoric update holds det F = 1 to round-off.
 - **Excess mass by penalty springs.** A solid denser than the fluid carries its excess mass on partner points tied to
   the material points by stiff springs; the finite stiffness allows a small slip (reported in the history), and the
   spring bound can limit the time step.
 - **Gravity on the excess mass is not modelled.**
-- **Inlet resistance is not modelled.** The pneumatic chamber imposes the inlet pressure at the hole; there is no
-  orifice pressure loss.
+- **Inlet line.** The default ideal inlet imposes the line pressure at the hole, with no loss. The opt-in capped inlet
+  adds the line's friction and junction losses and a free-flow cap, but no pump or valve dynamics and no
+  compressibility in the line (the narrowest passage's Mach number is only logged).
 - **Membrane volume error.** Thin membranes of material points gain or lose enclosed volume over a run; drivers should
   monitor the reported volume error and stop at a threshold.
 - **Explicit elasticity.** The time step is limited by the elastic shear-wave CFL condition (and by the excess-mass
