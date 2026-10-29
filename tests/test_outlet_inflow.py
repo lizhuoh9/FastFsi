@@ -10,8 +10,8 @@ On the duct rig of test_pressure_regions.py (8 x 8 x 32, z graded, z-min outlet,
      guard ratio <= 1e-4; the outlet monitors split the outlet flux into inflow and outflow;
   3. mechanism: from a divergence-free exchange through the outlet (half the bottom up, half down, zero net), no
      forcing, 1000 steps under "static" and under "total_pressure" (the up-flow and the kinetic energy every 50 steps
-     are printed): "total_pressure" does not run away (its KE at the end <= KE(0)) and ends with up-flow and KE <= those
-     of "static"."""
+     are printed): "total_pressure" does not run away (its KE at the end <= KE(0)) and ends with up-flow and KE <= 0.9 x
+     those of "static" (a condition that does nothing fails)."""
 import math
 from types import SimpleNamespace
 
@@ -29,6 +29,7 @@ P_IN = 4500.0
 W_IN, W_OUT = 0.30, -0.20                 # the hand-set outlet faces (m/s)
 EXCHANGE_W = 0.20                         # the exchange's largest outlet speed (m/s)
 MECHANISM_STEPS, MECHANISM_EVERY = 1000, 50
+MECHANISM_SHARE_MAX = 0.9                 # total pressure's up-flow and KE at the end <= 0.9 x static's
 DRIVER_KWARGS = dict(iterations=400, pressure_outlet_zmin=True, pressure_reachability_prepared=True,
                      reset_pressure=False, pressure_solver="fv_cg", cg_tolerance=duct.CG_TOLERANCE,
                      cg_preconditioner="fv_multigrid", pressure_solve_failure_policy="raise", read_report=False)
@@ -242,4 +243,5 @@ def test_total_pressure_does_not_feed_the_outlet_exchange():
     ke_0 = runs["total_pressure"][0][0][1]
     assert runs["static"][0][0] == runs["total_pressure"][0][0]
     assert ke_t <= ke_0
-    assert up_t <= up_s and ke_t <= ke_s
+    # total pressure must remove a clear share of the exchange that static pressure keeps (measured: 0.48 and 0.80)
+    assert up_t <= MECHANISM_SHARE_MAX * up_s and ke_t <= MECHANISM_SHARE_MAX * ke_s

@@ -711,7 +711,8 @@ class ColumnPressureChamber(Checkpointable):
         self.outlet_guard.arm()
 
     def after_project(self, dt_s, p_air_pa):
-        """Outlet-face correction for the nonzero ghost value p~_out = -p_air (one kernel; no host reads)."""
+        """Outlet-face correction for the nonzero ghost value p~_out = -p_air, and -p_air - rho w^2 / 2 on an inflow face
+        under outlet_inflow="total_pressure" (one kernel; no host reads)."""
         if self.last_p_air_pa is None or float(p_air_pa) != self.last_p_air_pa:
             raise ValueError("after_project must use the p_air of the preceding update() (%r vs %r)"
                              % (p_air_pa, self.last_p_air_pa))

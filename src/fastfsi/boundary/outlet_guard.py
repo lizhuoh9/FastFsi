@@ -2,7 +2,8 @@
 chamber that solves a shifted pressure (ColumnPressureChamber, PressureRegions and through it PneumaticChamber).
 
 THE SPLIT OUTLET CORRECTION.  The projection solves p~ = p - p_ref, so the outlet ghost value is p~_out = -p_ref
-(physical 0 at the outlet face).  The solver itself corrects the outlet face with ghost 0 and books the interface flux
+(physical 0 at the outlet face; under outlet_inflow="total_pressure" an inflow face has -p_ref - rho w^2 / 2, THE
+INFLOW FACES below).  The solver itself corrects the outlet face with ghost 0 and books the interface flux
 s = (dt / rho)(D p~ - R) on every row; the chamber's after_project() then adds the missing part, (dt / rho) R dz0 on the
 face and (dt / rho) R on s.  Between the two halves an outlet row satisfies div + s - volume_source = 0 (the solver's
 half), and the chamber's half keeps it (div and s change by opposite amounts).  Between the halves the outlet face is
