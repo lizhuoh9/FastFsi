@@ -46,6 +46,9 @@ flow step runs at the accepted volume (air_volume_m3, the INLET_GAS cells' free 
 included, + the line volume) with Q = 0 while the inlet is covered.  The region is a gas spring like a pocket: its
 omega = sqrt(p_abs A^2 / (V m)) (A, m: gas_regions_device's opt-in inlet spring sums) joins dt_limit() as
 0.9 x 0.5 / omega.
+OUTLET INFLOW (outlet_inflow, passed to the PressureRegions): "static" (the default) or "total_pressure" (an inflow
+face of the z-min outlet at total pressure 0; outlet_guard's module docstring).  report() carries the PressureRegions'
+outlet monitors (inflow, outflow and the largest inflow w) and the mode.
 
 No `from __future__ import annotations` (Taichi kernel module).
 """
@@ -108,7 +111,7 @@ class PneumaticChamber:
                  inlet_traction=True, surface_tag=TAG_CHAMBER_SURFACE, max_pockets=4096, flood_batch=16,
                  staging=65536, seal_steps=N_SEAL, min_cells=M_MIN, raster_interval=1, inlet_model="ideal",
                  inlet_hole_length_m=None, inlet_hole_coefficients=None, inlet_flow_cap_m3_s=math.inf,
-                 inlet_line_volume_m3=0.0, inlet_line_elements=()):
+                 inlet_line_volume_m3=0.0, inlet_line_elements=(), outlet_inflow="static"):
         faces = tuple(np.asarray(f, dtype=np.float64) for f in axes.faces_m)
         box = chamber_box(faces, axis_xy_m, float(radius_m), float(box_z_lo_m), float(lid_z_m))
         self.fluid = fluid
@@ -147,7 +150,9 @@ class PneumaticChamber:
         self.occupancy = SolidOccupancy(axes, box, points, body_indices, reference_positions_m, spacing_m, sub=sub,
                                        stretch_factor=stretch_factor, box_samples=box_samples,
                                        hysteresis_steps=hysteresis_steps, point_mass_kg=point_mass_kg)
-        self.chamber = PressureRegions(fluid, box, penalty_factor=penalty_factor, max_pockets=max_pockets)
+        self.chamber = PressureRegions(fluid, box, penalty_factor=penalty_factor, max_pockets=max_pockets,
+                                       outlet_inflow=outlet_inflow)
+        self.outlet_inflow = self.chamber.outlet_inflow
         self.air_cell = ti.field(ti.i32, shape=self.shape)
         cx, cy, cz = (0.5 * (f[lo:hi] + f[lo + 1:hi + 1]) for f, (lo, hi) in zip(faces, box))
         r = np.hypot(cx[:, None] - self.axis_xy_m[0], cy[None, :] - self.axis_xy_m[1])

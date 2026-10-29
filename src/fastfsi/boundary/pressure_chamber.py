@@ -48,7 +48,9 @@ value may enter R.  The solver therefore solves the shifted pressure p~ = p - p_
      the deviation is ~ (local jump of p~) / (c_pen * den / T);
   2. z-min outlet cells (k = 0, liquid, not chamber): R = T_out * p~_out with p~_out = -p_chamber(t), where
      T_out = w_face * 2 / dz_0^2 is the solver's own outlet ghost coefficient (ghost pressure at the face, half a cell
-     from the centre); the solver uses ghost value 0 there, and moving T_out p~_out to the right side gives R;
+     from the centre); the solver uses ghost value 0 there, and moving T_out p~_out to the right side gives R; with
+     outlet_inflow="total_pressure" an inflow face (stored w > 0) has p~_out = -p_chamber(t) - rho w^2 / 2 (total
+     pressure 0; outlet_guard.outlet_ghost_pressure, the module docstring there);
   3. after the projection the solver has corrected the outlet face with ghost 0, so the missing term
      u_z(i, j, 0) += w_face * (dt / rho) * 2 p~_out / dz_0 = (dt / rho) * R * dz_0 is added by after_project(), which
      also moves the interface flux the solver booked as s = (dt / rho) (D p - R) onto the face (s += (dt / rho) R),
@@ -81,6 +83,7 @@ import taichi as ti
 
 from fastfsi.boundary.outlet_guard import PROJECT_REQUIREMENTS as SHIFTED_OUTLET_REQUIREMENTS
 from fastfsi.boundary.outlet_guard import OutletShiftGuard, merge_project_requirements  # noqa: F401 (re-export)
+from fastfsi.boundary.outlet_guard import check_outlet_inflow, outlet_ghost_pressure, outlet_half_rho_field
 from fastfsi.errors import SimulationHardStop
 from fastfsi.io.checkpoint import Checkpointable
 from fastfsi.point_tags import TAG_CHAMBER_SURFACE
@@ -280,7 +283,7 @@ class ColumnPressureChamber(Checkpointable):
 
     def __init__(self, fluid, axes, footprint, lid_z_m, points, *, penalty_factor=DEFAULT_PENALTY_FACTOR,
                  tag_bit=TAG_CHAMBER_SURFACE, fallback_events_path=None, candidate_margin_m=DEFAULT_CANDIDATE_MARGIN_M,
-                 edge_extension_max_m=None, lower_bound="surface", material_body_id=0):
+                 edge_extension_max_m=None, lower_bound="surface", material_body_id=0, outlet_inflow="static"):
         grid = fluid.grid
         shape = tuple(int(v) for v in grid.grid_nodes)
         if axes is not None and tuple(int(v) for v in axes.n) != shape:
@@ -288,6 +291,8 @@ class ColumnPressureChamber(Checkpointable):
         penalty = float(penalty_factor)
         if not math.isfinite(penalty) or penalty <= 0.0:
             raise ValueError("penalty_factor must be finite and positive")
+        self.outlet_inflow = check_outlet_inflow(outlet_inflow)
+        self.outlet_total_pressure = self.outlet_inflow == "total_pressure"
         margin = float(candidate_margin_m)
         if not (math.isfinite(margin) and margin >= 0.0):
             raise ValueError("candidate_margin_m must be finite and >= 0")
@@ -313,6 +318,7 @@ class ColumnPressureChamber(Checkpointable):
         self.footprint_columns = int(footprint.sum())
         self.air_cell = ti.field(ti.i32, shape=shape)
         self.outlet_rhs = ti.field(ti.f64, shape=shape[:2])      # this module's copy of R at k = 0
+        self.outlet_half_rho = outlet_half_rho_field(self.outlet_inflow, self.rho)     # None under "static"
         # exactly once + the outlet invariant + the projection contract of the class
         self.outlet_guard = OutletShiftGuard(fluid, requirements=type(self).PROJECT_REQUIREMENTS)
         self.stats = ti.field(ti.f64, shape=STATS_SLOTS)
@@ -613,7 +619,8 @@ class ColumnPressureChamber(Checkpointable):
                     self.fluid.velocity_dirichlet_boundary_pressure_mobility,
                     self.fluid.velocity_dirichlet_boundary_hard_fixed_component_mask, i, j, k, 4, authority)
                 dz = ti.cast(self.fluid.cell_width_z_m[k], ti.f64)
-                rhs = weight * 2.0 / (dz * dz) * (-p_air)          # R = T_out p~_out, p~_out = -p_air
+                rhs = weight * 2.0 / (dz * dz) * outlet_ghost_pressure(     # R = T_out p~_out (module docstring, 2)
+                    p_air, self.fluid.velocity, i, j, self.outlet_half_rho, ti.static(self.outlet_total_pressure))
             self.fluid.pressure_interface_matrix_diagonal[i, j, k] = diagonal
             self.fluid.pressure_interface_matrix_rhs[i, j, k] = rhs
             if k == 0:
@@ -782,7 +789,7 @@ class ColumnPressureChamber(Checkpointable):
             raise SimulationHardStop("pressure_chamber_no_chamber_cells", dict(
                 events=int(s[S_NO_AIR_EVENTS]), first_t_s=float(s[S_NO_AIR_T])))
         p_air = 0.0 if self.last_p_air_pa is None else self.last_p_air_pa
-        out = dict(t_s=self.last_t_s, p_air_pa=p_air,
+        out = dict(t_s=self.last_t_s, p_air_pa=p_air, outlet_inflow=self.outlet_inflow,
                    penalty_factor=self.penalty_factor, steps=int(s[S_STEPS]),
                    air_cell_count=int(s[S_AIR_CELLS]), air_volume_m3=float(s[S_AIR_VOLUME]),
                    p_tilde_air_max_abs_pa=float(s[S_AIR_PMAX]),

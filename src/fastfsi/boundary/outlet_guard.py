@@ -13,10 +13,22 @@ cleanup that uses div without s.  The chamber's half then lands on a changed fac
 divergence of the size (dt / rho) |R|.  The next step's right-hand side carries it, so the outlet ghost doubles and the
 water near the outlet settles near -p_ref instead of 0.
 
+THE INFLOW FACES (option outlet_inflow of the chambers, OUTLET_INFLOW_MODES).  "static" (the default): p~_out = -p_ref
+on every outlet face, physical static pressure 0 for inflow and outflow alike.  "total_pressure": on an INFLOW face
+(stored z velocity w > 0, upward into the domain) the TOTAL pressure is 0, p_out = -rho w^2 / 2, so
+p~_out = -p_ref - rho w^2 / 2: the water enters from a still reservoir (Bernoulli), and the boundary adds no kinetic
+energy of the normal motion through inflow faces (with static pressure 0 that influx can feed an exchange through the
+outlet that grows).  Outflow faces (w <= 0) keep -p_ref.  Only the normal component enters; the 1/2 is physical.  w is
+the face's stored velocity when the chamber's update() runs (the start of the step: the previous step's final
+velocity), so the option needs no state.  outlet_ghost_pressure() is the one place that computes p~_out; its mode is a
+compile-time switch, so "static" compiles the rows as they were before the option existed.  The density enters as a
+0-d f64 field (outlet_half_rho_field): a Python float in a kernel is a default_fp constant, f32 in the production runs.
+
 THIS MODULE (one code path for every shifted-outlet chamber):
   - PROJECT_REQUIREMENTS: the projection contract of the shifted outlet (z-min outlet, conjugate gradient with the
     multigrid preconditioner, outlet backflow ALLOWED, no pressure accumulation).  Chambers carry it as the class
     attribute PROJECT_REQUIREMENTS.
+  - check_outlet_inflow / outlet_half_rho_field / outlet_ghost_pressure: the inflow faces' option (above).
   - merge_project_requirements(chamber, kwargs): the caller's project() kwargs with the chamber's contract merged in.
     It raises for a chamber whose class declares no contract and for a caller value that conflicts with the contract
     (the multigrid preconditioner family counts as one value).  Never a silent default.
@@ -56,6 +68,38 @@ SHIFT_FLOOR_PRESSURE_PA = 200.0        # the denominator floor: the shift of |p_
 HARD_STOP_CODES = {"outlet_shift_invariant"}
 G_PRE, G_POST, G_SHIFT, G_CALLS, G_FLOOR = 0, 1, 2, 3, 4
 G_SLOTS = 5
+OUTLET_INFLOW_MODES = ("static", "total_pressure")   # an inflow face's ghost: static pressure 0 | total pressure 0
+
+
+def check_outlet_inflow(mode):
+    """The outlet_inflow option itself when it is one of OUTLET_INFLOW_MODES; ValueError otherwise."""
+    if mode not in OUTLET_INFLOW_MODES:
+        raise ValueError("outlet_inflow must be one of %s, got %r" % (OUTLET_INFLOW_MODES, mode))
+    return mode
+
+
+def outlet_half_rho_field(mode, rho):
+    """The 0-d f64 field rho / 2 that outlet_ghost_pressure reads under "total_pressure"; None under "static" (no
+    field: the static rows read nothing new)."""
+    if check_outlet_inflow(mode) == "static":
+        return None
+    half_rho = ti.field(ti.f64, shape=())
+    half_rho[None] = 0.5 * float(rho)
+    return half_rho
+
+
+@ti.func
+def outlet_ghost_pressure(p_ref, velocity: ti.template(), i, j, half_rho: ti.template(),
+                          total_pressure: ti.template()):
+    """The shifted ghost value p~_out of the z-min outlet face of column (i, j): -p_ref, and with total_pressure (a
+    compile-time bool) -p_ref - rho w^2 / 2 where the face's stored velocity w = velocity[i, j, 0].z is positive
+    (inflow).  half_rho: outlet_half_rho_field's field (None under static)."""
+    value = -p_ref
+    if ti.static(total_pressure):
+        w = ti.cast(velocity[i, j, 0].z, ti.f64)
+        if w > 0.0:
+            value -= half_rho[None] * w * w
+    return value
 
 
 def merge_project_requirements(chamber, project_kwargs):

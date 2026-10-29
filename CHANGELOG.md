@@ -57,6 +57,15 @@ First version of the package layout `src/fastfsi` (replaces the earlier flat lay
   raises `ValueError` in `after_project()` when the projection since `update()` ran without the chamber's
   `PROJECT_REQUIREMENTS` (one host comparison per step, no device access; `verify_contract = False` only for tests
   that reproduce the defect on purpose).
+- Total-pressure outlet inflow (`outlet_inflow="total_pressure"` on `PressureRegions`, `ColumnPressureChamber` and
+  `PneumaticChamber`, opt-in; the default `"static"` is unchanged): with static pressure 0 on every z-min outlet face,
+  water entering through an inflow face brings its kinetic energy into the domain, which can feed a two-way exchange
+  through the outlet that grows.  Total pressure puts an inflow face (stored w > 0) at p = −ρw²/2, water from a still
+  reservoir, so the boundary adds no kinetic energy of the normal motion; outflow faces keep p = 0.  One function,
+  `fastfsi.boundary.outlet_guard.outlet_ghost_pressure`, computes the ghost value for both chambers; its mode is a
+  compile-time switch and w is the face velocity stored when `update()` runs, so nothing new is checkpointed.
+  `PressureRegions.report()` (and `PneumaticChamber.report()`) add read-only outlet monitors in either mode: the
+  inflow and outflow sums of w A and the largest inflow w.
 - Sealing rule of the gas regions (`DeviceGasRegions`, `PneumaticChamber`; `seal_steps`, `min_cells`): a region cut
   off from the inlet gas becomes a sealed pocket only after it persisted `seal_steps` occupancy updates
   (`N_SEAL` = 5) with at least `min_cells` cells (`M_MIN` = 8); until then it stays inlet gas at the inlet pressure.
