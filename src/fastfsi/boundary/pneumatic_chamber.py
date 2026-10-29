@@ -3,9 +3,14 @@ SolidOccupancy (where the body is) + DeviceGasRegions (inlet air, water, pockets
 PressureRegions (per-cell Dirichlet pressures) + the covered-inlet traction, behind the ColumnPressureChamber driving
 protocol (update / after_project / air_cell / report / physical pressure / checkpoint) plus accept().
 
-INLET.  A disc of diameter d in the lid (the top face of the fluid domain) centred at (x, y).  Its inlet cells are the
-box's top-layer cells whose centres lie in the disc, plus the cell of the disc centre.  Inlet-connected air takes the
-line pressure p_in(t) with no resistance (an ideal inlet).
+INLET.  A disc of diameter d in the lid centred at (x, y).  Its inlet cells are the box's top-layer cells whose centres
+lie in the disc, plus the cell of the disc centre.  Inlet-connected air takes the line pressure p_in(t) with no
+resistance (an ideal inlet).
+LID.  A z face of the grid: the top face of the fluid domain (the lid is the domain's top wall), or an interior face
+with water beyond the lid (an open domain).  Then the box ends at the lid, its top layer (the inlet cells' layer) is the
+layer under the lid, and every footprint cell (r <= radius) of the layer above the lid must be obstacle -- the lid's
+plate -- or the constructor refuses ("water above the chamber lid").  The water beyond the plate is ordinary water
+outside the box (p_ref = p_in there, as on every other non-box cell of PressureRegions).
 COVERED INLET.  When no inlet cell is free, no Dirichlet cell carries p_in any more.  The line pressure
 then acts on the covering membrane as the force p_in A_hole along the lid normal into the chamber (downward for
 p_in > 0, upward under suction).  It is distributed over the chamber-surface points (tag `surface_tag`) whose deformed
@@ -72,24 +77,37 @@ from fastfsi.point_tags import TAG_CHAMBER_SURFACE
 HARD_STOP_CODES = {"pneumatic_chamber_inlet_without_surface", "pneumatic_chamber_floor_material"} | INLET_AIR_HARD_STOP_CODES
 NOISE_EVENT_LOG_MAX = 200                # the first events kept in full (the counts are complete)
 FOOTPRINT_SAMPLES = 8
+LID_FACE_TOLERANCE_M = 1.0e-6            # the lid's distance to its z face of the grid
 
 
 def chamber_box(faces, axis_xy_m, radius_m, z_lo_m, lid_z_m):
     """Half-open cell ranges of the box: x-y cells meeting the footprint square, z from the cell holding z_lo_m to the
-    top layer (the lid must be the domain top)."""
+    lid.  The lid must be a z face of the grid (within LID_FACE_TOLERANCE_M): the top face (the lid is the domain's top
+    wall) or an interior face (water beyond the lid; PneumaticChamber checks the plate above it)."""
     fx, fy, fz = (np.asarray(f, dtype=np.float64) for f in faces)
-    if abs(fz[-1] - float(lid_z_m)) > 1.0e-6:
-        raise ValueError("the lid %.6f m is not the top face of the grid %.6f m" % (lid_z_m, fz[-1]))
+    k_lid = int(np.argmin(np.abs(fz - float(lid_z_m))))
+    if abs(fz[k_lid] - float(lid_z_m)) > LID_FACE_TOLERANCE_M:
+        raise ValueError("the lid %.6f m is not a z face of the grid (nearest %.6f m)" % (lid_z_m, fz[k_lid]))
     ranges = []
     for f, centre in ((fx, axis_xy_m[0]), (fy, axis_xy_m[1])):
         lo = max(int(np.searchsorted(f, centre - radius_m, side="right")) - 2, 0)
         hi = min(int(np.searchsorted(f, centre + radius_m, side="left")) + 1, len(f) - 1)
         ranges.append((lo, hi))
     k0 = int(np.searchsorted(fz, z_lo_m, side="right")) - 1
-    if not 0 <= k0 < len(fz) - 2:
-        raise ValueError("box_z_lo_m %.6f is outside the grid" % z_lo_m)
-    ranges.append((k0, len(fz) - 1))
+    if not 0 <= k0 < k_lid - 1:
+        raise ValueError("box_z_lo_m %.6f is outside the grid below the lid" % z_lo_m)
+    ranges.append((k0, k_lid))
     return tuple(ranges)
+
+
+def lid_plate_gaps(obstacle, box, footprint):
+    """The open cells of the plate over a lid inside the grid: cells of the box's footprint (footprint: (nx_box, ny_box)
+    bool) in the first layer above the lid that are not obstacle.  0 when the lid is the grid's top face."""
+    k_above = box[2][1]
+    if k_above >= np.shape(obstacle)[2]:
+        return 0
+    layer = np.asarray(obstacle)[box[0][0]:box[0][1], box[1][0]:box[1][1], k_above] != 0
+    return int((np.asarray(footprint, dtype=bool) & ~layer).sum())
 
 
 def _no_run_transfers():
@@ -156,7 +174,12 @@ class PneumaticChamber:
         self.air_cell = ti.field(ti.i32, shape=self.shape)
         cx, cy, cz = (0.5 * (f[lo:hi] + f[lo + 1:hi + 1]) for f, (lo, hi) in zip(faces, box))
         r = np.hypot(cx[:, None] - self.axis_xy_m[0], cy[None, :] - self.axis_xy_m[1])
-        obstacle = fluid.obstacle.to_numpy()[box[0][0]:box[0][1], box[1][0]:box[1][1], box[2][0]:box[2][1]] != 0
+        obstacle_grid = fluid.obstacle.to_numpy()
+        gaps = lid_plate_gaps(obstacle_grid, box, r <= self.radius_m)
+        if gaps:
+            raise ValueError("water above the chamber lid: %d footprint cells of the layer above the lid are not "
+                             "obstacle" % gaps)
+        obstacle = obstacle_grid[box[0][0]:box[0][1], box[1][0]:box[1][1], box[2][0]:box[2][1]] != 0
         wall = obstacle | (r > self.radius_m)[:, :, None]
         disc = np.hypot(cx[:, None] - self.inlet_centre_xy_m[0], cy[None, :] - self.inlet_centre_xy_m[1])
         inlet = np.zeros(wall.shape, dtype=bool)
