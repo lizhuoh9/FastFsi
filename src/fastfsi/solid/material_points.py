@@ -9,6 +9,11 @@ tags, the external load and an extra point force consumed by the next spread.  T
 move by themselves: the coupler moves them with the interpolated fluid velocity and updates F with the interpolated
 velocity gradient, and it evaluates the stress.
 
+Per-body materials (3-D, opt-in, body_materials): a table body id -> NeoHookeanMaterial, the ids without an entry
+keeping `material`.  The 3-D coupler then reads mu and kappa per point by its body id, the excess mass takes each point's
+own density, and the elastic limits take the stiffest body.  The scalars mu, kappa and rho_s stay the main material's
+(the diagnostics' mass and every other scalar use).  Without the table every path is the single material as before.
+
 3-D positions are integrated as the displacement u = x - X0 (f32): an absolute f32 coordinate near 1 m has an ulp of
 1.2e-7 m, so slow motions would be lost in x += dt v; x = X0 + u is kept as the current-position field and positions()
 sums X0 + u in float64.
@@ -34,6 +39,7 @@ import taichi as ti
 from fastfsi.errors import SimulationHardStop
 from fastfsi.io.checkpoint import Checkpointable
 from fastfsi.point_tags import TAG_CONTACT_RIM
+from fastfsi.solid.materials import NeoHookeanMaterial
 
 REDUCE_SLOTS = 32
 PLANAR_REDUCE_SLOTS = 16
@@ -133,7 +139,7 @@ class MaterialPoints(Checkpointable):
     CHECKPOINT_FIELDS = ("u", "F", "f_extra")
 
     def __init__(self, *, positions_m, volumes_m3, material, tether_mask, body_id=None, tag=None,
-                 external_force_n=None, near_surface_mask=None, probe_indices=()):
+                 external_force_n=None, near_surface_mask=None, probe_indices=(), body_materials=None):
         positions = np.asarray(positions_m, dtype=np.float32)
         if positions.ndim != 2 or positions.shape[1] != 3 or len(positions) == 0:
             raise ValueError("MaterialPoints needs an (n, 3) array of positions")
@@ -195,6 +201,7 @@ class MaterialPoints(Checkpointable):
         self.tether.from_numpy(tether)
         self.body_id.from_numpy(np.zeros(n, np.int32) if body_id is None else np.asarray(body_id, np.int32))
         self.body_ids = tuple(sorted(int(b) for b in np.unique(self.body_id.to_numpy())))
+        self._init_body_materials(material, body_materials)
         self.tag.from_numpy(np.zeros(n, np.int32) if tag is None else np.asarray(tag, np.int32))
         self.near_surface.from_numpy(np.zeros(n, np.int32) if near_surface_mask is None
                                      else np.asarray(near_surface_mask, dtype=np.int32))
@@ -333,9 +340,63 @@ class MaterialPoints(Checkpointable):
         return out
 
     def elastic_dt_limit(self, cfl, min_spacing_m):
-        """CFL on the shear wave over the smallest cell edge min_spacing_m."""
-        c_s = math.sqrt(self.mu / self.rho_s)
+        """CFL on the shear wave over the smallest cell edge min_spacing_m (the fastest body's wave with per-body
+        materials)."""
+        if self.per_body_material:
+            c_s = max(math.sqrt(m.shear_modulus_pa / m.density_kgm3) for m in self.body_materials.values())
+        else:
+            c_s = math.sqrt(self.mu / self.rho_s)
         return float(cfl) * float(min_spacing_m) / c_s
+
+    # ------------------------------------------------------------------------------------------------ per-body
+    def _init_body_materials(self, material, body_materials):
+        """The opt-in per-body table (module docstring): body id -> NeoHookeanMaterial for ids 0 .. MAX_BODIES - 1,
+        every point's body id inside that range, the ids without an entry keeping `material`."""
+        self.per_body_material = body_materials is not None
+        self.body_materials = None
+        if not self.per_body_material:
+            return
+        table = {}
+        for key, value in dict(body_materials).items():
+            if isinstance(key, bool) or not isinstance(key, (int, np.integer)) or not 0 <= int(key) < MAX_BODIES:
+                raise ValueError("per-body material ids must be integers 0 .. %d, got %r" % (MAX_BODIES - 1, key))
+            body = int(key)
+            if not isinstance(value, NeoHookeanMaterial):
+                raise TypeError("per-body materials must be NeoHookeanMaterial, got %r for body %d" % (value, body))
+            table[body] = value
+        if any(not 0 <= b < MAX_BODIES for b in self.body_ids):
+            raise ValueError("per-body materials need every body id in 0 .. %d, got %s" % (MAX_BODIES - 1,
+                                                                                          list(self.body_ids)))
+        full = [table.get(b, material) for b in range(MAX_BODIES)]
+        self._material_table = tuple(full)
+        self.body_materials = {b: full[b] for b in self.body_ids}
+        self.mu_body = ti.field(ti.f32, shape=MAX_BODIES)
+        self.kappa_body = ti.field(ti.f32, shape=MAX_BODIES)
+        self.mu_body.from_numpy(np.array([m.shear_modulus_pa for m in full], np.float32))
+        self.kappa_body.from_numpy(np.array([m.volumetric_modulus_pa for m in full], np.float32))
+        if not np.all(np.isfinite(self.mu_body.to_numpy()) & np.isfinite(self.kappa_body.to_numpy())):
+            raise ValueError("per-body mu and kappa must be finite in float32")
+
+    def shear_modulus_max_pa(self):
+        """The stiffest body's mu with per-body materials, else the material's own mu."""
+        if not self.per_body_material:
+            return self.mu
+        return max(m.shear_modulus_pa for m in self.body_materials.values())
+
+    def density_per_point_kgm3(self):
+        """Each point's reference density (float64, host): its body's with per-body materials, else rho_s."""
+        if not self.per_body_material:
+            return np.full(self.n, self.rho_s, np.float64)
+        rho = np.array([m.density_kgm3 for m in self._material_table], np.float64)
+        return rho[self.body_id.to_numpy()]
+
+    def body_material_report(self):
+        """The per-body table as {body id: (rho, mu, kappa)} for the bodies present (None without it): run metadata
+        and checkpoint fingerprints."""
+        if not self.per_body_material:
+            return None
+        return {int(b): (float(m.density_kgm3), float(m.shear_modulus_pa), float(m.volumetric_modulus_pa))
+                for b, m in sorted(self.body_materials.items())}
 
     def _after_load_state(self):
         """x = X0 + u, the expression of the step kernels."""

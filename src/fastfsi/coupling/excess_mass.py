@@ -87,7 +87,19 @@ def validate_densities(points, fluid, fluid_density_kgm3=None):
         raise ValueError("IB solid and fluid densities must be positive and finite")
     if rho_s < rho_f:
         raise ValueError("rho_s < rho_f is unsupported by positive reference excess mass")
+    for rho in _body_densities(points):                  # per-body materials: every body's density too
+        if not (math.isfinite(rho) and rho > 0.0):
+            raise ValueError("IB solid and fluid densities must be positive and finite")
+        if rho < rho_f:
+            raise ValueError("rho_s < rho_f is unsupported by positive reference excess mass")
     return rho_s, rho_f
+
+
+def _body_densities(points):
+    """The per-body densities of 3-D points with per-body materials (empty otherwise)."""
+    if not getattr(points, "per_body_material", False):
+        return ()
+    return tuple(float(m.density_kgm3) for m in points.body_materials.values())
 
 
 @ti.func
@@ -128,14 +140,17 @@ class PenaltyExcessMass(Checkpointable):
         cfl = float(cfl_elastic)
         if not (math.isfinite(cfl) and cfl > 0.):
             raise ValueError("excess mass needs a positive finite elastic CFL")
-        self.neutral_elastic_dt = cfl * float(min_spacing_m) / math.sqrt(self.points.mu / self.rho_f)
+        mu = self.points.shear_modulus_max_pa() if hasattr(self.points, "shear_modulus_max_pa") else self.points.mu
+        self.neutral_elastic_dt = cfl * float(min_spacing_m) / math.sqrt(mu / self.rho_f)
         self.omega_rad_s = OMEGA_DT_FRACTION / self.neutral_elastic_dt if omega_rad_s is None else float(omega_rad_s)
         if not (math.isfinite(self.omega_rad_s) and self.omega_rad_s > 0.):
             raise ValueError("excess mass omega_rad_s must be positive and finite")
         volumes = (self.points.area if self.dim == 2 else self.points.vol).to_numpy().astype(np.float64)
         if not np.all(np.isfinite(volumes) & (volumes > 0.)):
             raise ValueError("excess mass requires positive finite reference point areas/volumes")
-        mass = (self.points.rho_s - self.rho_f) * volumes
+        rho = (self.points.density_per_point_kgm3() if getattr(self.points, "per_body_material", False)
+               else self.points.rho_s)                   # per-body materials: each point's own density
+        mass = (rho - self.rho_f) * volumes
         # Both clamps still move their tethered points, so every point carries its excess mass.
         if not np.all(np.isfinite(mass)):
             raise ValueError("reference excess mass is not finite")
@@ -715,8 +730,11 @@ class PenaltyExcessMass(Checkpointable):
         digest.update(self.mass.to_numpy().tobytes())
         digest.update(self.points.X0.to_numpy().tobytes())
         # the label is part of the checkpoint identity; it stays unchanged so that existing checkpoints still match
-        digest.update(repr((self.dim, self.rho_f, self.points.rho_s, self.omega_rad_s,
-                            self.coupler.clamp_mode, "fixed_penalty_symplectic_euler_reference_v0")).encode())
+        key = (self.dim, self.rho_f, self.points.rho_s, self.omega_rad_s,
+               self.coupler.clamp_mode, "fixed_penalty_symplectic_euler_reference_v0")
+        if _body_densities(self.points):                 # per-body materials only: the default digest is unchanged
+            key = key + (("body_densities", _body_densities(self.points)),)
+        digest.update(repr(key).encode())
         return digest.hexdigest()
 
 
@@ -735,7 +753,8 @@ class ExcessMassCouplerMixin:
         if excess_mass_mode not in EXCESS_MASS_MODES:
             raise ValueError("excess_mass_mode must be auto or diagnostic off")
         self.excess_mass_mode = excess_mass_mode
-        self.excess_mass_enabled = self.rho_s > self.rho_f and excess_mass_mode == "auto"
+        heaviest = max((self.rho_s,) + _body_densities(points))      # per-body materials: any body heavier than water
+        self.excess_mass_enabled = heaviest > self.rho_f and excess_mass_mode == "auto"
         self.excess_mass = None
         self.geometry_epoch = 0          # changes whenever point positions or kernel supports may have changed
 
@@ -787,12 +806,16 @@ class ExcessMassCouplerMixin:
     def density_report(self):
         """Density set-up of the coupling, for run metadata."""
         enabled = self.excess_mass is not None
-        return dict(mode=self.excess_mass_mode, target_reference_density_ratio=self.rho_s / self.rho_f,
-                    effective_reference_density_kgm3=self.rho_s if enabled else self.rho_f,
-                    effective_reference_density_ratio=self.rho_s / self.rho_f if enabled else 1.,
-                    reference_excess_mass=0. if not enabled else self.excess_mass.reference_mass_sum,
-                    omega_rad_s=None if not enabled else self.excess_mass.omega_rad_s,
-                    method="fixed_penalty_spring_partner" if enabled else "neutral_single_velocity")
+        report = dict(mode=self.excess_mass_mode, target_reference_density_ratio=self.rho_s / self.rho_f,
+                      effective_reference_density_kgm3=self.rho_s if enabled else self.rho_f,
+                      effective_reference_density_ratio=self.rho_s / self.rho_f if enabled else 1.,
+                      reference_excess_mass=0. if not enabled else self.excess_mass.reference_mass_sum,
+                      omega_rad_s=None if not enabled else self.excess_mass.omega_rad_s,
+                      method="fixed_penalty_spring_partner" if enabled else "neutral_single_velocity")
+        if getattr(self.points, "per_body_material", False):      # the per-body densities (opt-in table)
+            report["body_densities_kgm3"] = {int(b): float(m.density_kgm3)
+                                             for b, m in sorted(self.points.body_materials.items())}
+        return report
 
     def _excess_mass_diagnostics(self, material_momentum):
         """The partner diagnostics and the reference body momentum rho_f V0 U + M_ex V (U: interpolated material

@@ -20,6 +20,12 @@ REFERENCE FIELD.  The projection solves p~ = p - p_ref with the piecewise-consta
   5. PHYSICAL PRESSURE p = p~ + p_ref (physical_pressure_into); report() gives physical values.
   6. OUTLET MONITORS (report(), read-only, either mode): over the outlet faces of code-0 cells, the inflow sum w A of
      the faces with w > 0 (m3/s), the outflow sum of those with w < 0 (m3/s, <= 0) and the largest inflow w (m/s).
+EXTERNAL REGION (opt-in, attach_external_region; the s26 outer chamber's cavity, boundary.cavity_gas): one more gas
+region -- the cells of a second box where a caller-owned i32 field is non-zero -- with the caller's gauge pressure (an
+f64 0-d field) as its reference.  The second box may overlap the region box (the cavity's annulus surrounds the
+chamber's box); on a cell that both mark the region's own code wins and the cell is counted (external_conflicts).  Its
+rows are Dirichlet rows like a pocket's (never outlet rows), rules 2, 4 and 5 treat its reference jumps as every other
+jump, and report() counts its cells apart.  Without it every kernel is the one above.
 Per step: set_regions(codes, pocket gauge pressures) when the classification changed (host -> device), update(t,
 p_in) -> project -> after_project(dt, p_in) with the same p_in.  update() and after_project() are one kernel each and
 read nothing back.  No pocket and every code 0 or 1 reproduces ColumnPressureChamber's rows for the same air cells (the
@@ -90,8 +96,20 @@ class PressureRegions(Checkpointable):
         self.last_t_s = None
         self.steps = 0
         self._physical_pressure = None
+        self.has_external = False            # attach_external_region (opt-in); read by the kernels at compile time
+        self._reported = False               # report() compiles _report_kernel too: attach must come before it
 
     # ------------------------------------------------------------------------------------------------ helpers
+    @ti.func
+    def _external(self, i, j, k):
+        """1 on a cell of the attached external region (only compiled with one)."""
+        hit = 0
+        a, b, c = i - self._ext_offset[0], j - self._ext_offset[1], k - self._ext_offset[2]
+        if 0 <= a < self._ext_shape[0] and 0 <= b < self._ext_shape[1] and 0 <= c < self._ext_shape[2]:
+            if self.ext_code[a, b, c] != 0:
+                hit = 1
+        return hit
+
     @ti.func
     def _code(self, i, j, k):
         code = 0
@@ -154,9 +172,15 @@ class PressureRegions(Checkpointable):
             value = p_in
             if code >= 2:
                 value = self.pocket_gauge[code - 2]
+            if ti.static(self.has_external):
+                if code == 0 and self._external(i, j, k) != 0:
+                    value = self.ext_gauge[None]
             self.p_ref[i, j, k] = value
         for s in ti.static((S_INLET_CELLS, S_POCKET_CELLS, S_JUMP_ROWS)):
             self.stats[s] = 0.0
+        if ti.static(self.has_external):
+            self.ext_stats[0] = 0.0
+            self.ext_stats[1] = 0.0
         for i, j, k in self.p_ref:
             diagonal = ti.cast(0.0, ti.f64)
             jump = ti.cast(0.0, ti.f64)
@@ -177,12 +201,21 @@ class PressureRegions(Checkpointable):
                 if k < self.shape[2] - 1:
                     jump += products[5] * (self.p_ref[i, j, k + 1] - here)
                 code = self._code(i, j, k)
-                if code >= 1:
+                external = 0
+                if ti.static(self.has_external):
+                    external = self._external(i, j, k)
+                if code >= 1 or external != 0:
                     diagonal = penalty * denominator
                     if code == 1:
                         ti.atomic_add(self.stats[S_INLET_CELLS], 1.0)
-                    else:
+                    elif code >= 2:
                         ti.atomic_add(self.stats[S_POCKET_CELLS], 1.0)
+                    else:
+                        if ti.static(self.has_external):
+                            ti.atomic_add(self.ext_stats[0], 1.0)
+                    if ti.static(self.has_external):
+                        if code >= 1 and external != 0:           # both mark the cell: the region's code won
+                            ti.atomic_add(self.ext_stats[1], 1.0)
                 elif k == 0:
                     weight = self._face_weight(i, j, k, 4)
                     dz = ti.cast(self.fluid.cell_width_z_m[k], ti.f64)
@@ -244,7 +277,10 @@ class PressureRegions(Checkpointable):
         for i, j, k in self.p_ref:
             if self.fluid.obstacle[i, j, k] == 0:
                 p_tilde = ti.cast(self.fluid.pressure[i, j, k], ti.f64)
-                if self._code(i, j, k) >= 1:
+                external = 0
+                if ti.static(self.has_external):
+                    external = self._external(i, j, k)
+                if self._code(i, j, k) >= 1 or external != 0:
                     ti.atomic_max(self.stats[S_DIRICHLET_PMAX], ti.abs(p_tilde))
                 else:
                     residual = ti.abs(self._face_divergence(i, j, k)
@@ -291,6 +327,29 @@ class PressureRegions(Checkpointable):
         table[:len(gauge)] = gauge
         self.pocket_gauge.from_numpy(table)
 
+    def attach_external_region(self, box_cells, code_field, gauge_field):
+        """Opt-in external gas region (module docstring): the cells of `box_cells` (three half-open cell ranges inside
+        the grid; it may overlap this box) where code_field (an i32 field of that box's shape, owned and updated by the
+        caller) is non-zero take gauge_field[None] (an f64 0-d field, the caller's) as their reference pressure.
+        Attach before the first update() or report(): the kernels compile with it."""
+        if self.steps or self._reported or self.has_external:
+            raise RuntimeError("attach_external_region must come before the first update() or report(), once")
+        ranges = tuple((int(lo), int(hi)) for lo, hi in box_cells)
+        if len(ranges) != 3 or any(not 0 <= lo < hi <= n for (lo, hi), n in zip(ranges, self.shape)):
+            raise ValueError("the external box must be three half-open cell ranges inside the grid, got %r" % (box_cells,))
+        shape = tuple(hi - lo for lo, hi in ranges)
+        if tuple(int(v) for v in code_field.shape) != shape or code_field.dtype != ti.i32:
+            raise ValueError("code_field must be an i32 field of the external box's shape %s" % (shape,))
+        if tuple(gauge_field.shape) != () or gauge_field.dtype != ti.f64:
+            raise ValueError("gauge_field must be a 0-d f64 field")
+        self.external_box_cells = ranges
+        self._ext_offset = tuple(lo for lo, _ in ranges)
+        self._ext_shape = shape
+        self.ext_code = code_field
+        self.ext_gauge = gauge_field
+        self.ext_stats = ti.field(ti.f64, shape=2)       # external Dirichlet cells, cells both regions mark
+        self.has_external = True
+
     def update(self, t_s, p_in_pa):
         """Reference field, penalty diagonal and right-hand side for this step's solve (one kernel, no host reads);
         p_in_pa is the inlet gauge pressure at the solve (the step midpoint)."""
@@ -332,13 +391,19 @@ class PressureRegions(Checkpointable):
         (div + s - volume source), the rows with a reference jump, the outlet flux (m3/s), the outlet monitors (rule
         6) and the outlet_inflow mode."""
         self._report_kernel()
+        self._reported = True
         s = self.stats.to_numpy()
-        return dict(inlet_cells=int(s[S_INLET_CELLS]), pocket_cells=int(s[S_POCKET_CELLS]),
-                    pockets=self.pocket_count, dirichlet_p_tilde_max_pa=float(s[S_DIRICHLET_PMAX]),
-                    water_divergence_max_1ps=float(s[S_WATER_DIV]), jump_rows=int(s[S_JUMP_ROWS]),
-                    outlet_flux_m3s=float(s[S_OUTLET_FLUX]), p_in_pa=self.last_p_in_pa, t_s=self.last_t_s,
-                    outlet_divergence_max_1ps=float(s[S_OUTLET_DIV]),
-                    interior_divergence_max_1ps=float(s[S_INTERIOR_DIV]),
-                    outlet_inflow_m3s=float(s[S_OUTLET_INFLOW]), outlet_outflow_m3s=float(s[S_OUTLET_OUTFLOW]),
-                    outlet_inflow_w_max_mps=float(s[S_OUTLET_W_MAX]), outlet_inflow=self.outlet_inflow,
-                    **self.outlet_guard.report())
+        out = dict(inlet_cells=int(s[S_INLET_CELLS]), pocket_cells=int(s[S_POCKET_CELLS]),
+                   pockets=self.pocket_count, dirichlet_p_tilde_max_pa=float(s[S_DIRICHLET_PMAX]),
+                   water_divergence_max_1ps=float(s[S_WATER_DIV]), jump_rows=int(s[S_JUMP_ROWS]),
+                   outlet_flux_m3s=float(s[S_OUTLET_FLUX]), p_in_pa=self.last_p_in_pa, t_s=self.last_t_s,
+                   outlet_divergence_max_1ps=float(s[S_OUTLET_DIV]),
+                   interior_divergence_max_1ps=float(s[S_INTERIOR_DIV]),
+                   outlet_inflow_m3s=float(s[S_OUTLET_INFLOW]), outlet_outflow_m3s=float(s[S_OUTLET_OUTFLOW]),
+                   outlet_inflow_w_max_mps=float(s[S_OUTLET_W_MAX]), outlet_inflow=self.outlet_inflow,
+                   **self.outlet_guard.report())
+        if self.has_external:                 # the attached external region's Dirichlet cells (last update)
+            ext = self.ext_stats.to_numpy()
+            out["external_cells"] = int(ext[0])
+            out["external_conflicts"] = int(ext[1])
+        return out

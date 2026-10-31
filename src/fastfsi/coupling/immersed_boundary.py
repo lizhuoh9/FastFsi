@@ -41,6 +41,9 @@ G - tr(G)/3 I in both F updates and renormalises it by det(F)^(-1/3), so det F =
 |det F - 1| removed since the last f_update_report() is kept.  It acts on every point whose F is updated (held points
 follow held_f).  The default f_update="full" is the update as before.
 
+Per-body materials (3-D, opt-in: MaterialPoints(body_materials=...), the s26 outer chamber): the stress takes each
+point's body's mu and kappa, and elastic_dt_limit the stiffest body; without the table the kernels compile as before.
+
 Point tags (fastfsi.point_tags): the min D of the TAG_CHAMBER_SURFACE points and of the free TAG_CONTACT_RIM points are
 reported separately.
 
@@ -223,7 +226,12 @@ class ImmersedBoundaryCoupler(ExcessMassCouplerMixin, Checkpointable):
     def _spread_kernel(self, force: ti.template(), tether_k: ti.f32, load_scale: ti.f32, mu: ti.f32, kappa: ti.f32):
         for p in range(self.n):
             xp = self.points.x[p]
-            tau = evaluate_neo_hookean_kirchhoff(self.points.F[p], mu, kappa)
+            mu_p, kappa_p = mu, kappa
+            if ti.static(self.points.per_body_material):       # the point's body's material (opt-in table)
+                body = self.points.body_id[p]
+                mu_p = self.points.mu_body[body]
+                kappa_p = self.points.kappa_body[body]
+            tau = evaluate_neo_hookean_kirchhoff(self.points.F[p], mu_p, kappa_p)
             self.points.tau[p] = tau
             v0 = self.points.vol[p]
             pull = ti.Vector([0.0, 0.0, 0.0])
@@ -584,20 +592,24 @@ class ImmersedBoundaryCoupler(ExcessMassCouplerMixin, Checkpointable):
         return {**out, **self._excess_mass_diagnostics(solid["momentum"])}
 
     def elastic_dt_limit(self, cfl):
-        """CFL on the shear wave over the smallest cell edge of the grid (conservative for graded grids)."""
-        return float(cfl) * self.weights.min_spacing_m / math.sqrt(self.points.mu / self.rho_f)
+        """CFL on the shear wave over the smallest cell edge of the grid (conservative for graded grids); the stiffest
+        body's wave with per-body materials."""
+        return float(cfl) * self.weights.min_spacing_m / math.sqrt(self.points.shear_modulus_max_pa() / self.rho_f)
 
     def fingerprint(self):
         """Static setup arrays that a checkpoint must match (reference positions, volumes, tethers, ids, tags, loads)
-        and the coupling parameters."""
+        and the coupling parameters (with the per-body table when it is on; the default digest is unchanged)."""
         points = self.points
         digest = hashlib.sha256()
         for field in (points.X0, points.vol, points.tether, points.body_id, points.tag, points.f_ext,
                       points.near_surface):
             digest.update(np.ascontiguousarray(field.to_numpy()).tobytes())
-        digest.update(repr((self.n, tuple(self.weights.n), points.rho_s, points.mu, points.kappa,
-                            self.tether_k, self.rho_f, self.excess_mass_mode,
-                            None if self.excess_mass is None else self.excess_mass.fingerprint())).encode())
+        key = (self.n, tuple(self.weights.n), points.rho_s, points.mu, points.kappa,
+               self.tether_k, self.rho_f, self.excess_mass_mode,
+               None if self.excess_mass is None else self.excess_mass.fingerprint())
+        if points.per_body_material:
+            key = key + (("body_materials", points.body_material_report()),)
+        digest.update(repr(key).encode())
         return digest.hexdigest()
 
 
